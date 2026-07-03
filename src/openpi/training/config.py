@@ -611,6 +611,16 @@ class TrainConfig:
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
 
+    # How often (in steps) to run the sampled-action eval and log RMSE to wandb. Set to 0 to disable.
+    # This samples actions with the diffusion/flow sampler and compares against ground-truth action
+    # chunks -- a far better progress signal than the flow-matching loss (which is a weak proxy for
+    # action accuracy). Uses a small fixed set of held-out batches.
+    eval_interval: int = 1000
+    # Number of fixed held-out batches to use for the sampled-action eval.
+    eval_num_batches: int = 2
+    # Number of denoising steps for the eval sampler (matches inference default).
+    eval_num_sample_steps: int = 10
+
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 
@@ -902,10 +912,10 @@ _CONFIGS = [
         ),
         batch_size=4,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=1_000,
             peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=0.3),
         freeze_filter=pi0_config.Pi0Config(
@@ -919,7 +929,7 @@ _CONFIGS = [
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=10_000,
+        num_train_steps=30_000,
     ),
     #
     # Fine-tuning Aloha configs.

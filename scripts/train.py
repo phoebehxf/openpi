@@ -191,6 +191,22 @@ def train_step(
     return new_state, info
 
 
+@at.typecheck
+def eval_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> at.Array:
+    """Sample an action chunk and return per-dim MSE (normalized space) vs ground truth."""
+    params = state.ema_params if state.ema_params is not None else state.params
+    model = nnx.merge(state.model_def, params)
+    model.eval()
+    observation, actions = batch
+    pred = model.sample_actions(rng, observation, num_steps=config.eval_num_sample_steps)
+    return jnp.mean((pred - actions) ** 2, axis=(0, 1))  # (action_dim,)
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -203,7 +219,7 @@ def main(config: _config.TrainConfig):
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
     rng = jax.random.key(config.seed)
-    train_rng, init_rng = jax.random.split(rng)
+    train_rng, init_rng, eval_rng = jax.random.split(rng, 3)
 
     mesh = sharding.make_mesh(config.fsdp_devices)
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
@@ -226,6 +242,19 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
+    # Hold out a small, fixed set of batches for the sampled-action RMSE eval. These are drawn once
+    # and never trained on, so the metric tracks generalization of the action mapping.
+    eval_batches: list[tuple[_model.Observation, _model.Actions]] = []
+    eval_active_idx = None
+    if config.eval_interval > 0 and config.eval_num_batches > 0:
+        eval_batches = [next(data_iter) for _ in range(config.eval_num_batches)]
+        # Determine which action dims actually vary (the rest are zero-padding up to the model dim).
+        all_act = np.concatenate(
+            [np.asarray(jax.device_get(b[1])).reshape(-1, b[1].shape[-1]) for b in eval_batches], axis=0
+        )
+        eval_active_idx = np.where(all_act.std(axis=0) > 1e-6)[0]
+        logging.info(f"Sampled-action eval: {len(eval_batches)} batches, active dims={eval_active_idx.tolist()}")
+
     # Log images from first batch to sanity check.
     images_to_log = [
         wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
@@ -245,6 +274,12 @@ def main(config: _config.TrainConfig):
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
+    )
+
+    peval_step = jax.jit(
+        functools.partial(eval_step, config),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        out_shardings=replicated_sharding,
     )
 
     start_step = int(train_state.step)
@@ -267,6 +302,28 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
+
+        if eval_batches and step % config.eval_interval == 0:
+            per_dim = []
+            with sharding.set_mesh(mesh):
+                for i, eb in enumerate(eval_batches):
+                    # Fix the sampling seed per batch (independent of step) so the flow-matching noise
+                    # is identical across checkpoints -- otherwise the RMSE curve is not comparable.
+                    per_dim.append(np.asarray(peval_step(jax.random.fold_in(eval_rng, i), train_state, eb)))
+            per_dim = np.sqrt(np.mean(per_dim, axis=0))  # per-dim RMSE (action_dim,)
+            active = per_dim[eval_active_idx]
+            metrics = {
+                "eval/sample_rmse_norm": float(active.mean()),
+                # Gripper is the last active action dim in the Libero/Piper layout; track it separately
+                # since it is the failure-prone dimension for pick-and-place.
+                "eval/gripper_rmse_norm": float(per_dim[eval_active_idx[-1]]),
+            }
+            pbar.write(
+                f"Step {step}: eval/sample_rmse_norm={metrics['eval/sample_rmse_norm']:.4f} "
+                f"gripper={metrics['eval/gripper_rmse_norm']:.4f}"
+            )
+            wandb.log(metrics, step=step)
+
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
