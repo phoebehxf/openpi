@@ -23,6 +23,17 @@ SERVER_ARGS="--env LIBERO" docker compose -f examples/libero/compose.yml up --bu
 MUJOCO_GL=glx SERVER_ARGS="--env LIBERO" docker compose -f examples/libero/compose.yml up --build
 ```
 
+checkpoint error:
+```bash
+echo $DISPLAY
+xhost +local:docker
+
+MUJOCO_GL=glx \
+SERVER_ARGS="--env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir gs://openpi-assets/checkpoints/pi05_libero" \
+docker compose -f examples/libero/compose.yml up --build
+
+```
+
 You can customize the loaded checkpoint by providing additional `SERVER_ARGS` (see `scripts/serve_policy.py`), and the LIBERO task suite by providing additional `CLIENT_ARGS` (see `examples/libero/main.py`).
 For example:
 
