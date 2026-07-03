@@ -28,6 +28,7 @@ class Args:
     camera_height: int = 480
     camera_fps: int = 15
     image_size: int = 224
+    show_preview: bool = True
     control_hz: float = 5.0
     open_loop_horizon: int = 2
     max_steps: int = 300
@@ -176,10 +177,52 @@ def preprocess_image(image: np.ndarray, image_size: int) -> np.ndarray:
     return image_tools.convert_to_uint8(image)
 
 
-def build_observation(cameras: CameraRig, robot: PiperRobotClient, prompt: str, image_size: int) -> dict:
+def draw_preview(
+    global_raw: np.ndarray,
+    wrist_raw: np.ndarray,
+    global_model: np.ndarray,
+    wrist_model: np.ndarray,
+) -> None:
+    import cv2
+
+    def _bgr(image: np.ndarray) -> np.ndarray:
+        return image[..., ::-1].copy()
+
+    def _label(image: np.ndarray, text: str) -> np.ndarray:
+        out = image.copy()
+        cv2.putText(out, text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        return out
+
+    raw_h = min(global_raw.shape[0], wrist_raw.shape[0])
+    raw_w_global = int(global_raw.shape[1] * raw_h / global_raw.shape[0])
+    raw_w_wrist = int(wrist_raw.shape[1] * raw_h / wrist_raw.shape[0])
+    raw_global = cv2.resize(_bgr(global_raw), (raw_w_global, raw_h))
+    raw_wrist = cv2.resize(_bgr(wrist_raw), (raw_w_wrist, raw_h))
+    raw_panel = np.hstack((_label(raw_global, "global raw"), _label(raw_wrist, "wrist raw")))
+
+    model_global = _bgr(global_model)
+    model_wrist = _bgr(wrist_model)
+    model_panel = np.hstack((_label(model_global, "global model"), _label(model_wrist, "wrist model")))
+
+    preview = np.vstack((raw_panel, model_panel))
+    cv2.imshow("openpi piper preview", preview)
+    cv2.waitKey(1)
+
+
+def build_observation(
+    cameras: CameraRig, robot: PiperRobotClient, prompt: str, image_size: int, *, show_preview: bool
+) -> dict:
+    global_raw = cameras.get_global_image()
+    wrist_raw = cameras.get_wrist_image()
+    global_model = preprocess_image(global_raw, image_size)
+    wrist_model = preprocess_image(wrist_raw, image_size)
+
+    if show_preview:
+        draw_preview(global_raw, wrist_raw, global_model, wrist_model)
+
     return {
-        "observation/image": preprocess_image(cameras.get_global_image(), image_size),
-        "observation/wrist_image": preprocess_image(cameras.get_wrist_image(), image_size),
+        "observation/image": global_model,
+        "observation/wrist_image": wrist_model,
         "observation/state": robot.get_state(),
         "prompt": prompt,
     }
@@ -201,7 +244,13 @@ def main(args: Args) -> None:
             start = time.perf_counter()
 
             if action_chunk is None or action_index >= min(args.open_loop_horizon, len(action_chunk)):
-                obs = build_observation(cameras, robot, args.prompt, args.image_size)
+                obs = build_observation(
+                    cameras,
+                    robot,
+                    args.prompt,
+                    args.image_size,
+                    show_preview=args.show_preview,
+                )
                 action_chunk = np.asarray(client.infer(obs)["actions"], dtype=np.float32)
                 action_index = 0
                 print(f"step={step} fetched action chunk shape={action_chunk.shape}")
@@ -214,6 +263,10 @@ def main(args: Args) -> None:
             if elapsed < dt:
                 time.sleep(dt - elapsed)
     finally:
+        if args.show_preview:
+            import cv2
+
+            cv2.destroyAllWindows()
         cameras.close()
         robot.close()
 
