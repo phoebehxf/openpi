@@ -20,6 +20,8 @@ class Args:
     bci_piper_root: str = "/home/huix/bci_robot/bci_piper"
     robot_model: str = "piper"
     real: bool = False
+    # Requires --real. Reads real joints/cameras/policy and computes the target, but never sends motion.
+    dry_run: bool = False
     speed_percent: int = 10
     global_camera_model: str = "D435"
     wrist_camera_model: str = "D405"
@@ -136,8 +138,16 @@ class PiperRobotClient:
         self._action_alpha = float(args.action_alpha)
         self._action_mode = str(args.action_mode).lower()
         self._disable_gripper = bool(args.disable_gripper)
+        self._dry_run = bool(args.dry_run)
         if self._action_mode not in ("absolute", "delta"):
             raise ValueError(f"Unsupported action_mode: {args.action_mode}")
+        if self._dry_run and not self._robot.real:
+            raise ValueError(
+                "--dry_run requires --real: it reads real joint feedback but skips motion. "
+                "Without --real the state is faked to zeros and tells you nothing about safety."
+            )
+        if self._dry_run:
+            print("[dry-run] real feedback ON, motion OFF: move_j/gripper commands will NOT be sent.")
 
     def get_state(self) -> np.ndarray:
         if not self._robot.real:
@@ -180,11 +190,12 @@ class PiperRobotClient:
             )
         gripper = self._gripper_fraction if self._disable_gripper else float(np.clip(action[6], 0.0, 1.0))
 
-        self._robot._ensure_control_mode()
-        self._robot.robot.set_motion_mode("j")
-        self._robot.robot.move_j(clipped_target.tolist())
-        if not self._disable_gripper:
-            self._robot._set_gripper_fraction(gripper)
+        if not self._dry_run:
+            self._robot._ensure_control_mode()
+            self._robot.robot.set_motion_mode("j")
+            self._robot.robot.move_j(clipped_target.tolist())
+            if not self._disable_gripper:
+                self._robot._set_gripper_fraction(gripper)
 
         self._gripper_fraction = gripper
         sent = np.asarray(list(clipped_target) + [gripper], dtype=np.float32)
