@@ -128,6 +128,9 @@ class PiperRobotClient:
         self._max_joint_delta_rad = float(args.max_joint_delta_rad)
 
     def get_state(self) -> np.ndarray:
+        if not self._robot.real:
+            return np.asarray([0, 0, 0, 0, 0, 0, self._gripper_fraction], dtype=np.float32)
+
         joints = self._robot._read_joints(timeout=0.2)
         if joints is None:
             raise RuntimeError("Failed to read Piper joint angles.")
@@ -140,6 +143,15 @@ class PiperRobotClient:
         action = np.asarray(action, dtype=np.float32)
         if action.shape != (7,):
             raise ValueError(f"Expected action shape (7,), got {action.shape}")
+
+        if not self._robot.real:
+            gripper = float(np.clip(action[6], 0.0, 1.0))
+            print(
+                "dry-run action:",
+                {"target": action[:6].round(4).tolist(), "gripper": round(gripper, 3)},
+            )
+            self._gripper_fraction = gripper
+            return
 
         current = self._robot._read_joints(timeout=0.2)
         if current is None:
@@ -154,17 +166,10 @@ class PiperRobotClient:
         )
         gripper = float(np.clip(action[6], 0.0, 1.0))
 
-        if not self._robot.real:
-            print(
-                "dry-run action:",
-                {"current": current.round(4).tolist(), "target": clipped_target.round(4).tolist(), "gripper": round(gripper, 3)},
-            )
-        else:
-            self._robot._ensure_control_mode()
-            self._robot.robot.set_motion_mode("j")
-            self._robot.robot.move_j(clipped_target.tolist())
-            self._robot._set_gripper_fraction(gripper)
-
+        self._robot._ensure_control_mode()
+        self._robot.robot.set_motion_mode("j")
+        self._robot.robot.move_j(clipped_target.tolist())
+        self._robot._set_gripper_fraction(gripper)
         self._gripper_fraction = gripper
 
     def close(self) -> None:
