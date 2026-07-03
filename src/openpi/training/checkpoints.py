@@ -45,7 +45,9 @@ def initialize_checkpoint_dir(
             "params": ocp.PyTreeCheckpointHandler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=1,
+            # None => keep ALL checkpoints (no automatic deletion). Set to an int to cap how many
+            # recent checkpoints are retained (older non-`keep_period` ones get pruned on each save).
+            max_to_keep=2,
             keep_period=keep_period,
             create=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),

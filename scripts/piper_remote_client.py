@@ -22,6 +22,8 @@ class Args:
     real: bool = False
     # Requires --real. Reads real joints/cameras/policy and computes the target, but never sends motion.
     dry_run: bool = False
+    # Cut motor torque on exit (arm has no brake -> it DROPS if unsupported). Off by default for safety.
+    disable_on_exit: bool = False
     speed_percent: int = 10
     global_camera_model: str = "D435"
     wrist_camera_model: str = "D405"
@@ -139,6 +141,7 @@ class PiperRobotClient:
         self._action_mode = str(args.action_mode).lower()
         self._disable_gripper = bool(args.disable_gripper)
         self._dry_run = bool(args.dry_run)
+        self._disable_on_exit = bool(args.disable_on_exit)
         if self._action_mode not in ("absolute", "delta"):
             raise ValueError(f"Unsupported action_mode: {args.action_mode}")
         if self._dry_run and not self._robot.real:

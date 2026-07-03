@@ -8,8 +8,13 @@ nothing useful. Run this first so every experiment starts from the same, in-dist
 Default home target is episode 0 frame 0 of phoebe777777/piper-pick-up-repaired:
     [-0.028, 0.403, 0.000, 0.041, 0.379, -0.021]   (gripper open)
 
-The move is done by slew-limited interpolation from the current joints to the target, so it
-crawls there instead of snapping. Keep a hand on the e-stop.
+IMPORTANT SAFETY NOTES:
+- Piper `move_j` is a point-to-point command; this sends it ONCE and polls until arrived.
+  Do NOT stream move_j at high rate -- overlapping P2P commands make the arm move erratically.
+- The arm has no mechanical brake. `RobotArm.close()` calls `disable()`, which cuts motor
+  torque and makes the arm DROP under gravity. This script does NOT disable on exit by default;
+  it leaves the arm enabled and holding position. Support the arm before you power it down.
+  Pass --disable-on-exit only when the arm is in a safe/supported position.
 """
 
 import dataclasses
@@ -30,14 +35,14 @@ class Args:
     speed_percent: int = 10
     # Training home = ep0 frame0 state of piper-pick-up-repaired (6 joints, radians).
     home: tuple[float, float, float, float, float, float] = (-0.028, 0.403, 0.000, 0.041, 0.379, -0.021)
-    # Max joint change per control step (rad) -- safety slew-rate limit.
-    step_rad: float = 0.03
-    control_hz: float = 30.0
     # Tolerance (rad) to consider a joint "arrived".
-    tol_rad: float = 0.01
-    max_steps: int = 2000
+    tol_rad: float = 0.02
+    # How long to wait for the single move_j to reach the target before giving up (seconds).
+    arrive_timeout_s: float = 30.0
     # Skip the interactive confirmation before moving.
     yes: bool = False
+    # Cut motor torque on exit (arm will DROP if unsupported). Off by default for safety.
+    disable_on_exit: bool = False
 
 
 def _load_robot(args: Args):
@@ -52,11 +57,25 @@ def _load_robot(args: Args):
     cfg = module.ControlConfig(
         robot_model=args.robot_model,
         speed_percent=args.speed_percent,
-        joint_step_rad=args.step_rad,
     )
     robot = module.RobotArm(real=args.real, cfg=cfg)
     robot.connect()
     return robot
+
+
+def _safe_teardown(robot, args: Args) -> None:
+    """Release the connection WITHOUT cutting torque, unless explicitly asked to disable."""
+    if robot.robot is None:
+        return
+    try:
+        if args.disable_on_exit:
+            print("[home] disabling motors (arm will go limp) ...")
+            robot.robot.disable()
+        else:
+            print("[home] leaving motors ENABLED and holding. Support the arm before power-off.")
+        robot.robot.disconnect()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[home] teardown warning: {exc!r}")
 
 
 def main(args: Args) -> None:
@@ -78,41 +97,36 @@ def main(args: Args) -> None:
         print("[home] current :", np.round(current, 3).tolist())
         print("[home] target  :", np.round(target, 3).tolist())
         print("[home] delta   :", np.round(err, 3).tolist())
-        print(f"[home] max |delta| = {np.abs(err).max():.3f} rad, "
-              f"est. steps ~ {int(np.ceil(np.abs(err).max() / args.step_rad))} @ {args.control_hz}Hz")
+        print(f"[home] max |delta| = {np.abs(err).max():.3f} rad")
 
         if not args.yes:
-            reply = input("[home] proceed with slew move? type 'yes' to move: ").strip().lower()
+            reply = input("[home] send ONE move_j to home? type 'yes' to move: ").strip().lower()
             if reply != "yes":
                 print("[home] aborted.")
                 return
 
-        dt = 1.0 / args.control_hz
         robot._ensure_control_mode()
         robot.robot.set_motion_mode("j")
-        for step in range(args.max_steps):
-            start = time.perf_counter()
+        robot.robot.set_speed_percent(args.speed_percent)
+        # Single point-to-point move; the controller plans the trajectory at speed_percent.
+        robot.robot.move_j(target.tolist())
+        print("[home] move_j sent; polling until arrived ...")
+
+        deadline = time.time() + args.arrive_timeout_s
+        while time.time() < deadline:
             current = robot._read_joints(timeout=0.2)
-            if current is None:
-                raise RuntimeError("Failed to read Piper joint angles mid-move.")
-            current = np.asarray(current[:6], dtype=np.float32)
-            err = target - current
-            if np.abs(err).max() <= args.tol_rad:
-                print(f"[home] arrived at step {step}, joints=", np.round(current, 3).tolist())
-                break
-            step_cmd = np.clip(err, -args.step_rad, args.step_rad)
-            cmd = current + step_cmd
-            robot.robot.move_j(cmd.tolist())
-            if step % 10 == 0:
-                print(f"[home] step={step} joints={np.round(current,3).tolist()} "
-                      f"max|err|={np.abs(err).max():.3f}")
-            elapsed = time.perf_counter() - start
-            if elapsed < dt:
-                time.sleep(dt - elapsed)
+            if current is not None:
+                current = np.asarray(current[:6], dtype=np.float32)
+                err = target - current
+                if np.abs(err).max() <= args.tol_rad:
+                    print("[home] arrived, joints=", np.round(current, 3).tolist())
+                    break
+            time.sleep(0.1)
         else:
-            print("[home] WARNING: hit max_steps before reaching tolerance.")
+            print("[home] WARNING: did not reach tolerance within timeout; last joints=",
+                  np.round(current, 3).tolist() if current is not None else None)
     finally:
-        robot.close()
+        _safe_teardown(robot, args)
 
 
 if __name__ == "__main__":
