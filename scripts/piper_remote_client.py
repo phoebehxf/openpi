@@ -35,6 +35,7 @@ class Args:
     max_steps: int = 300
     max_joint_delta_rad: float = 0.03
     action_alpha: float = 0.15
+    action_mode: str = "absolute"
     disable_gripper: bool = True
     print_state_debug: bool = True
     print_every: int = 1
@@ -133,7 +134,10 @@ class PiperRobotClient:
         self._gripper_fraction = float(args.gripper_open_fraction)
         self._max_joint_delta_rad = float(args.max_joint_delta_rad)
         self._action_alpha = float(args.action_alpha)
+        self._action_mode = str(args.action_mode).lower()
         self._disable_gripper = bool(args.disable_gripper)
+        if self._action_mode not in ("absolute", "delta"):
+            raise ValueError(f"Unsupported action_mode: {args.action_mode}")
 
     def get_state(self) -> np.ndarray:
         if not self._robot.real:
@@ -163,13 +167,17 @@ class PiperRobotClient:
             raise RuntimeError("Failed to read Piper joint angles before action send.")
         current = np.asarray(current[:6], dtype=np.float32)
 
-        target_joints = np.asarray(action[:6], dtype=np.float32)
-        interpolated = current + self._action_alpha * (target_joints - current)
-        clipped_target = np.clip(
-            interpolated,
-            current - self._max_joint_delta_rad,
-            current + self._max_joint_delta_rad,
-        )
+        raw_action = np.asarray(action[:6], dtype=np.float32)
+        if self._action_mode == "delta":
+            delta = np.clip(raw_action, -1.0, 1.0) * self._max_joint_delta_rad
+            clipped_target = current + delta
+        else:
+            interpolated = current + self._action_alpha * (raw_action - current)
+            clipped_target = np.clip(
+                interpolated,
+                current - self._max_joint_delta_rad,
+                current + self._max_joint_delta_rad,
+            )
         gripper = self._gripper_fraction if self._disable_gripper else float(np.clip(action[6], 0.0, 1.0))
 
         self._robot._ensure_control_mode()
