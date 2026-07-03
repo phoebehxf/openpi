@@ -3,6 +3,7 @@ import importlib
 import pathlib
 import sys
 import time
+from typing import Optional
 
 import numpy as np
 import tyro
@@ -22,17 +23,22 @@ class Args:
     speed_percent: int = 10
     global_camera_model: str = "D435"
     wrist_camera_model: str = "D405"
-    global_camera_serial: str | None = None
-    wrist_camera_serial: str | None = None
+    global_camera_serial: Optional[str] = None
+    wrist_camera_serial: Optional[str] = None
     camera_width: int = 640
     camera_height: int = 480
     camera_fps: int = 15
     image_size: int = 224
     show_preview: bool = True
-    control_hz: float = 5.0
-    open_loop_horizon: int = 2
+    control_hz: float = 3.0
+    open_loop_horizon: int = 1
     max_steps: int = 300
-    max_joint_delta_rad: float = 0.08
+    max_joint_delta_rad: float = 0.03
+    action_alpha: float = 0.15
+    disable_gripper: bool = True
+    print_state_debug: bool = True
+    print_every: int = 1
+    freeze_observation: bool = False
     gripper_open_fraction: float = 1.0
     gripper_closed_fraction: float = 0.0
 
@@ -41,7 +47,6 @@ class RealSenseCamera:
     def __init__(self, serial: str, *, width: int, height: int, fps: int):
         import pyrealsense2 as rs
 
-        self._rs = rs
         self._pipeline = rs.pipeline()
         config = rs.config()
         config.enable_device(serial)
@@ -91,7 +96,7 @@ class CameraRig:
         print(f"Using global camera serial={global_serial}, wrist camera serial={wrist_serial}")
 
     @staticmethod
-    def _find_serial(devices: dict[str, str], model_substr: str) -> str:
+    def _find_serial(devices: dict, model_substr: str) -> str:
         for name, serial in devices.items():
             if model_substr in name:
                 return serial
@@ -127,10 +132,12 @@ class PiperRobotClient:
         self._robot.connect()
         self._gripper_fraction = float(args.gripper_open_fraction)
         self._max_joint_delta_rad = float(args.max_joint_delta_rad)
+        self._action_alpha = float(args.action_alpha)
+        self._disable_gripper = bool(args.disable_gripper)
 
     def get_state(self) -> np.ndarray:
         if not self._robot.real:
-            return np.asarray([0, 0, 0, 0, 0, 0, self._gripper_fraction], dtype=np.float32)
+            return np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, self._gripper_fraction], dtype=np.float32)
 
         joints = self._robot._read_joints(timeout=0.2)
         if joints is None:
@@ -140,38 +147,41 @@ class PiperRobotClient:
             raise RuntimeError(f"Expected Piper state shape (7,), got {state.shape}")
         return state
 
-    def send_action(self, action: np.ndarray) -> None:
+    def send_action(self, action: np.ndarray):
         action = np.asarray(action, dtype=np.float32)
         if action.shape != (7,):
             raise ValueError(f"Expected action shape (7,), got {action.shape}")
 
         if not self._robot.real:
-            gripper = float(np.clip(action[6], 0.0, 1.0))
-            print(
-                "dry-run action:",
-                {"target": action[:6].round(4).tolist(), "gripper": round(gripper, 3)},
-            )
+            gripper = self._gripper_fraction if self._disable_gripper else float(np.clip(action[6], 0.0, 1.0))
+            sent = np.asarray(list(action[:6]) + [gripper], dtype=np.float32)
             self._gripper_fraction = gripper
-            return
+            return None, action.copy(), sent
 
         current = self._robot._read_joints(timeout=0.2)
         if current is None:
             raise RuntimeError("Failed to read Piper joint angles before action send.")
         current = np.asarray(current[:6], dtype=np.float32)
 
-        target_joints = action[:6]
+        target_joints = np.asarray(action[:6], dtype=np.float32)
+        interpolated = current + self._action_alpha * (target_joints - current)
         clipped_target = np.clip(
-            target_joints,
+            interpolated,
             current - self._max_joint_delta_rad,
             current + self._max_joint_delta_rad,
         )
-        gripper = float(np.clip(action[6], 0.0, 1.0))
+        gripper = self._gripper_fraction if self._disable_gripper else float(np.clip(action[6], 0.0, 1.0))
 
         self._robot._ensure_control_mode()
         self._robot.robot.set_motion_mode("j")
         self._robot.robot.move_j(clipped_target.tolist())
-        self._robot._set_gripper_fraction(gripper)
+        if not self._disable_gripper:
+            self._robot._set_gripper_fraction(gripper)
+
         self._gripper_fraction = gripper
+        sent = np.asarray(list(clipped_target) + [gripper], dtype=np.float32)
+        current_state = np.asarray(list(current) + [self._gripper_fraction], dtype=np.float32)
+        return current_state, action.copy(), sent
 
     def close(self) -> None:
         self._robot.close()
@@ -182,12 +192,7 @@ def preprocess_image(image: np.ndarray, image_size: int) -> np.ndarray:
     return image_tools.convert_to_uint8(image)
 
 
-def draw_preview(
-    global_raw: np.ndarray,
-    wrist_raw: np.ndarray,
-    global_model: np.ndarray,
-    wrist_model: np.ndarray,
-) -> None:
+def draw_preview(global_raw: np.ndarray, wrist_raw: np.ndarray, global_model: np.ndarray, wrist_model: np.ndarray) -> None:
     import cv2
 
     def _bgr(image: np.ndarray) -> np.ndarray:
@@ -214,9 +219,7 @@ def draw_preview(
     cv2.waitKey(1)
 
 
-def build_observation(
-    cameras: CameraRig, robot: PiperRobotClient, prompt: str, image_size: int, *, show_preview: bool
-) -> dict:
+def build_observation(cameras: CameraRig, robot: PiperRobotClient, prompt: str, image_size: int, *, show_preview: bool):
     global_raw = cameras.get_global_image()
     wrist_raw = cameras.get_wrist_image()
     global_model = preprocess_image(global_raw, image_size)
@@ -225,12 +228,21 @@ def build_observation(
     if show_preview:
         draw_preview(global_raw, wrist_raw, global_model, wrist_model)
 
-    return {
+    obs = {
         "observation/image": global_model,
         "observation/wrist_image": wrist_model,
         "observation/state": robot.get_state(),
         "prompt": prompt,
     }
+    return obs, global_raw, wrist_raw
+
+
+def print_debug(step: int, state: Optional[np.ndarray], model_action: np.ndarray, sent_action: np.ndarray) -> None:
+    prefix = f"step={step}"
+    if state is not None:
+        print(prefix, "state=", np.round(state, 4).tolist())
+    print(prefix, "model_action=", np.round(model_action, 4).tolist())
+    print(prefix, "sent_action=", np.round(sent_action, 4).tolist())
 
 
 def main(args: Args) -> None:
@@ -243,35 +255,46 @@ def main(args: Args) -> None:
     action_chunk = None
     action_index = 0
     dt = 1.0 / args.control_hz
+    frozen_obs = None
 
     try:
         for step in range(args.max_steps):
             start = time.perf_counter()
 
             if action_chunk is None or action_index >= min(args.open_loop_horizon, len(action_chunk)):
-                obs = build_observation(
-                    cameras,
-                    robot,
-                    args.prompt,
-                    args.image_size,
-                    show_preview=args.show_preview,
-                )
+                if args.freeze_observation and frozen_obs is not None:
+                    obs = frozen_obs
+                else:
+                    obs, _, _ = build_observation(
+                        cameras,
+                        robot,
+                        args.prompt,
+                        args.image_size,
+                        show_preview=args.show_preview,
+                    )
+                    if args.freeze_observation and frozen_obs is None:
+                        frozen_obs = {k: (v.copy() if hasattr(v, 'copy') else v) for k, v in obs.items()}
                 action_chunk = np.asarray(client.infer(obs)["actions"], dtype=np.float32)
                 action_index = 0
                 print(f"step={step} fetched action chunk shape={action_chunk.shape}")
 
-            action = action_chunk[action_index]
+            model_action = action_chunk[action_index]
             action_index += 1
-            robot.send_action(action)
+            current_state, model_action_dbg, sent_action = robot.send_action(model_action)
+
+            if args.print_state_debug and step % max(1, args.print_every) == 0:
+                print_debug(step, current_state, model_action_dbg, sent_action)
 
             elapsed = time.perf_counter() - start
             if elapsed < dt:
                 time.sleep(dt - elapsed)
     finally:
         if args.show_preview:
-            import cv2
-
-            cv2.destroyAllWindows()
+            try:
+                import cv2
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
         cameras.close()
         robot.close()
 
