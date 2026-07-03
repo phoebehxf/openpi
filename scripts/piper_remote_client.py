@@ -198,6 +198,14 @@ def draw_preview(
         cv2.putText(out, text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
         return out
 
+    def _pad_to_width(image: np.ndarray, width: int) -> np.ndarray:
+        padding = width - image.shape[1]
+        if padding <= 0:
+            return image
+        left = padding // 2
+        right = padding - left
+        return cv2.copyMakeBorder(image, 0, 0, left, right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+
     raw_h = min(global_raw.shape[0], wrist_raw.shape[0])
     raw_w_global = int(global_raw.shape[1] * raw_h / global_raw.shape[0])
     raw_w_wrist = int(wrist_raw.shape[1] * raw_h / wrist_raw.shape[0])
@@ -209,6 +217,9 @@ def draw_preview(
     model_wrist = _bgr(wrist_model)
     model_panel = np.hstack((_label(model_global, "global model"), _label(model_wrist, "wrist model")))
 
+    preview_width = max(raw_panel.shape[1], model_panel.shape[1])
+    raw_panel = _pad_to_width(raw_panel, preview_width)
+    model_panel = _pad_to_width(model_panel, preview_width)
     preview = np.vstack((raw_panel, model_panel))
     cv2.imshow("openpi piper preview", preview)
     cv2.waitKey(1)
