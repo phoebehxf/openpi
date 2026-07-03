@@ -256,10 +256,17 @@ def build_observation(cameras: CameraRig, robot: PiperRobotClient, prompt: str, 
     return obs, global_raw, wrist_raw
 
 
-def print_debug(step: int, state: Optional[np.ndarray], model_action: np.ndarray, sent_action: np.ndarray) -> None:
+def print_debug(
+    step: int,
+    obs_state: np.ndarray,
+    exec_state: Optional[np.ndarray],
+    model_action: np.ndarray,
+    sent_action: np.ndarray,
+) -> None:
     prefix = f"step={step}"
-    if state is not None:
-        print(prefix, "state=", np.round(state, 4).tolist())
+    print(prefix, "obs_state=", np.round(obs_state, 4).tolist())
+    if exec_state is not None:
+        print(prefix, "exec_state=", np.round(exec_state, 4).tolist())
     print(prefix, "model_action=", np.round(model_action, 4).tolist())
     print(prefix, "sent_action=", np.round(sent_action, 4).tolist())
 
@@ -293,6 +300,7 @@ def main(args: Args) -> None:
                     )
                     if args.freeze_observation and frozen_obs is None:
                         frozen_obs = {k: (v.copy() if hasattr(v, 'copy') else v) for k, v in obs.items()}
+                obs_state = np.asarray(obs["observation/state"], dtype=np.float32)
                 action_chunk = np.asarray(client.infer(obs)["actions"], dtype=np.float32)
                 action_index = 0
                 print(f"step={step} fetched action chunk shape={action_chunk.shape}")
@@ -302,7 +310,7 @@ def main(args: Args) -> None:
             current_state, model_action_dbg, sent_action = robot.send_action(model_action)
 
             if args.print_state_debug and step % max(1, args.print_every) == 0:
-                print_debug(step, current_state, model_action_dbg, sent_action)
+                print_debug(step, obs_state, current_state, model_action_dbg, sent_action)
 
             elapsed = time.perf_counter() - start
             if elapsed < dt:
