@@ -1,6 +1,5 @@
 import dataclasses
 import importlib
-import pathlib
 import sys
 import time
 from typing import Optional
@@ -11,13 +10,18 @@ import tyro
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy
 
+try:
+    import piper_goto_home as home_utils
+except ImportError:
+    from scripts import piper_goto_home as home_utils
+
 
 @dataclasses.dataclass
 class Args:
     server_host: str
     server_port: int = 8000
     prompt: str = "pick up the object and place it in the basket"
-    bci_piper_root: str = "/home/huix/bci_robot/bci_piper"
+    bci_piper_root: Optional[str] = None
     robot_model: str = "piper"
     real: bool = False
     # Requires --real. Reads real joints/cameras/policy and computes the target, but never sends motion.
@@ -25,6 +29,15 @@ class Args:
     # Cut motor torque on exit (arm has no brake -> it DROPS if unsupported). Off by default for safety.
     disable_on_exit: bool = False
     speed_percent: int = 10
+    # Move the real arm to the training dataset's common start/end pose before policy control.
+    home_on_start: bool = True
+    home: tuple[float, float, float, float, float, float] = home_utils.DATASET_HOME_RAD
+    home_yes: bool = False
+    home_tol_rad: float = 0.02
+    home_timeout_s: float = 30.0
+    home_command_rate_hz: float = 50.0
+    home_max_joint_vel_rad_s: float = 0.15
+    home_hold_s: float = 0.5
     global_camera_model: str = "D435"
     wrist_camera_model: str = "D405"
     global_camera_serial: Optional[str] = None
@@ -120,10 +133,9 @@ class CameraRig:
 
 class PiperRobotClient:
     def __init__(self, args: Args):
-        root = pathlib.Path(args.bci_piper_root).expanduser().resolve()
+        root = home_utils._find_bci_piper_root(args.bci_piper_root)
         robot_side = root / "robot_arm_side"
-        if not robot_side.exists():
-            raise FileNotFoundError(f"Could not find bci_piper robot_arm_side at {robot_side}")
+        print(f"[robot] using bci_piper at {root}")
         if str(robot_side) not in sys.path:
             sys.path.insert(0, str(robot_side))
 
@@ -151,6 +163,63 @@ class PiperRobotClient:
             )
         if self._dry_run:
             print("[dry-run] real feedback ON, motion OFF: move_j/gripper commands will NOT be sent.")
+
+    def move_to_home(self, args: Args) -> None:
+        if not self._robot.real:
+            print("[home] simulated robot: startup home motion skipped")
+            return
+        if self._dry_run:
+            print("[home] dry-run: startup home motion skipped")
+            return
+
+        target = np.asarray(args.home, dtype=np.float32)
+        if target.shape != (6,):
+            raise ValueError(f"home must have 6 values, got {target.shape}")
+        current = self._robot._read_joints(timeout=0.5)
+        if current is None:
+            raise RuntimeError("Failed to read Piper joints before startup home.")
+        current = np.asarray(current[:6], dtype=np.float32)
+        print("[home] current:", np.round(current, 4).tolist())
+        print("[home] target :", np.round(target, 4).tolist())
+        print(f"[home] max |delta|={np.abs(target - current).max():.4f} rad")
+
+        if not args.home_yes:
+            reply = input("[home] move to home before policy control? type 'yes': ").strip().lower()
+            if reply != "yes":
+                raise RuntimeError("Startup home aborted; policy control was not started.")
+
+        self._robot._ensure_control_mode()
+        self._robot.robot.set_motion_mode("j")
+        self._robot.robot.set_speed_percent(args.speed_percent)
+        enable_deadline = time.monotonic() + 2.0
+        while not bool(self._robot.robot.enable()):
+            if time.monotonic() >= enable_deadline:
+                raise RuntimeError("Piper did not report enabled; policy control was not started.")
+            time.sleep(0.05)
+
+        home_args = home_utils.Args(
+            command_rate_hz=args.home_command_rate_hz,
+            max_joint_vel_rad_s=args.home_max_joint_vel_rad_s,
+            hold_s=args.home_hold_s,
+        )
+        home_utils._stream_move_to_home(self._robot, current, target, home_args)
+
+        deadline = time.monotonic() + args.home_timeout_s
+        period = 1.0 / args.home_command_rate_hz
+        last = current
+        while time.monotonic() < deadline:
+            self._robot.robot.move_j(target.tolist())
+            measured = self._robot._read_joints(timeout=min(0.05, period))
+            if measured is not None:
+                last = np.asarray(measured[:6], dtype=np.float32)
+                if np.abs(target - last).max() <= args.home_tol_rad:
+                    print("[home] arrived:", np.round(last, 4).tolist())
+                    return
+            time.sleep(period)
+        raise RuntimeError(
+            f"Startup home timed out; last joints={np.round(last, 4).tolist()}. "
+            "Policy control was not started."
+        )
 
     def get_state(self) -> np.ndarray:
         if not self._robot.real:
@@ -206,7 +275,14 @@ class PiperRobotClient:
         return current_state, action.copy(), sent
 
     def close(self) -> None:
-        self._robot.close()
+        if self._robot.robot is None:
+            return
+        if self._disable_on_exit:
+            print("[robot] disabling motors (arm will go limp)")
+            self._robot.robot.disable()
+        else:
+            print("[robot] leaving motors enabled; support arm before power-off")
+        self._robot.robot.disconnect()
 
 
 def preprocess_image(image: np.ndarray, image_size: int) -> np.ndarray:
@@ -298,6 +374,9 @@ def main(args: Args) -> None:
     frozen_obs = None
 
     try:
+        if args.home_on_start:
+            robot.move_to_home(args)
+
         for step in range(args.max_steps):
             start = time.perf_counter()
 
