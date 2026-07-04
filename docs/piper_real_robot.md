@@ -67,6 +67,12 @@ python scripts/piper_goto_home.py --real
 
 ## 3. 跑 client
 
+### 3.0 建立 ssh 连接
+
+```
+ssh -p 6767 -N -L 8000:127.0.0.1:8000 huix@10.61.8.18
+```
+
 ### 3.1 先 dry-run(强制,验证 pipeline 与安全)
 
 `--dry-run` **必须**配 `--real`:它读真实关节 + 相机、正常调用 server、算出目标关节,
