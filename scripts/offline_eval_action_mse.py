@@ -51,7 +51,7 @@ def _fmt(vec: np.ndarray, p: int = 4) -> list[float]:
 
 def main(
     config_name: str = "pi05_piper_pick_and_place",
-    checkpoint_dir: str = "checkpoints/pi05_piper_pick_and_place/piper_pick_pi05_lora_v1/9999",
+    checkpoint_dir: str = "checkpoints/pi05_piper_pick_and_place/piper_pick_pi05_lora_v2/29999",
     num_samples: int = 200,
     seed: int = 0,
     num_infer_samples: int = 1,

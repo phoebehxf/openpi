@@ -49,7 +49,9 @@ class Args:
     show_preview: bool = True
     control_hz: float = 3.0
     open_loop_horizon: int = 1
-    max_steps: int = 300
+    # Training episodes run ~740 frames (median, ~25s) up to ~1940 (~65s) at 30fps.
+    # 300 steps (~10s @30hz) cuts off before a pick-and-place finishes -> give it room.
+    max_steps: int = 1200
     max_joint_delta_rad: float = 0.03
     action_alpha: float = 0.15
     action_mode: str = "absolute"
@@ -59,6 +61,14 @@ class Args:
     freeze_observation: bool = False
     gripper_open_fraction: float = 1.0
     gripper_closed_fraction: float = 0.0
+    # The training gripper signal is effectively binary (0 or 1; ~0% of frames land
+    # in between), but the model emits a continuous fraction that hovers mid-range near
+    # open/close transitions -> sending it raw at control_hz makes the gripper chatter.
+    # Binarize with hysteresis: flip to closed only below close_threshold, back to open
+    # only above open_threshold, hold in the dead-band between.
+    gripper_binarize: bool = True
+    gripper_open_threshold: float = 0.6
+    gripper_close_threshold: float = 0.4
 
 
 class RealSenseCamera:
@@ -148,6 +158,13 @@ class PiperRobotClient:
         self._robot = module.RobotArm(real=args.real, cfg=cfg)
         self._robot.connect()
         self._gripper_fraction = float(args.gripper_open_fraction)
+        self._gripper_open_fraction = float(args.gripper_open_fraction)
+        self._gripper_closed_fraction = float(args.gripper_closed_fraction)
+        self._gripper_binarize = bool(args.gripper_binarize)
+        self._gripper_open_threshold = float(args.gripper_open_threshold)
+        self._gripper_close_threshold = float(args.gripper_close_threshold)
+        # Latched binary gripper state for hysteresis (True == open). Seed from the start pose.
+        self._gripper_open = float(args.gripper_open_fraction) >= 0.5
         self._max_joint_delta_rad = float(args.max_joint_delta_rad)
         self._action_alpha = float(args.action_alpha)
         self._action_mode = str(args.action_mode).lower()
@@ -221,6 +238,25 @@ class PiperRobotClient:
             "Policy control was not started."
         )
 
+    def _resolve_gripper(self, action_gripper: float) -> float:
+        """Map the model's raw gripper output to the value actually commanded.
+
+        Locked at the current fraction when --disable-gripper. Otherwise binarize with
+        hysteresis (the training signal is effectively 0/1, so a raw continuous command
+        chatters near transitions), or pass the clipped fraction through if binarize off.
+        """
+        if self._disable_gripper:
+            return self._gripper_fraction
+        frac = float(np.clip(action_gripper, 0.0, 1.0))
+        if not self._gripper_binarize:
+            return frac
+        if self._gripper_open:
+            if frac < self._gripper_close_threshold:
+                self._gripper_open = False
+        elif frac > self._gripper_open_threshold:
+            self._gripper_open = True
+        return self._gripper_open_fraction if self._gripper_open else self._gripper_closed_fraction
+
     def get_state(self) -> np.ndarray:
         if not self._robot.real:
             return np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, self._gripper_fraction], dtype=np.float32)
@@ -239,7 +275,7 @@ class PiperRobotClient:
             raise ValueError(f"Expected action shape (7,), got {action.shape}")
 
         if not self._robot.real:
-            gripper = self._gripper_fraction if self._disable_gripper else float(np.clip(action[6], 0.0, 1.0))
+            gripper = self._resolve_gripper(action[6])
             sent = np.asarray(list(action[:6]) + [gripper], dtype=np.float32)
             self._gripper_fraction = gripper
             return None, action.copy(), sent
@@ -260,7 +296,7 @@ class PiperRobotClient:
                 current - self._max_joint_delta_rad,
                 current + self._max_joint_delta_rad,
             )
-        gripper = self._gripper_fraction if self._disable_gripper else float(np.clip(action[6], 0.0, 1.0))
+        gripper = self._resolve_gripper(action[6])
 
         if not self._dry_run:
             self._robot._ensure_control_mode()
