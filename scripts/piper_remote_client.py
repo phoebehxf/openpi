@@ -32,7 +32,7 @@ class Args:
     # Move the real arm to the training dataset's common start/end pose before policy control.
     home_on_start: bool = True
     home: tuple[float, float, float, float, float, float] = home_utils.DATASET_HOME_RAD
-    home_yes: bool = False
+    home_yes: bool = True
     home_tol_rad: float = 0.02
     home_timeout_s: float = 30.0
     home_command_rate_hz: float = 50.0
