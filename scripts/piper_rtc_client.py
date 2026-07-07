@@ -69,6 +69,7 @@ class Args(prc.Args):
 class FetchResult:
     chunk: np.ndarray
     next_exec_idx: int
+    diagnostics: dict
 
 
 class ActionCurveLogger:
@@ -252,7 +253,7 @@ def main(args: Args) -> None:
         chunk = first.chunk
         exec_idx = first.next_exec_idx
         steps_since_swap = 0
-        print(f"step=0 first chunk shape={chunk.shape} infer={fetcher.last_infer_ms:.0f}ms")
+        print(f"step=0 first chunk shape={chunk.shape} infer={fetcher.last_infer_ms:.0f}ms {format_rtc_diag(first)}")
         action_curve.log_chunk(step=0, source="first_chunk", chunk=chunk, start_idx=exec_idx, horizon=eh)
 
         for step in range(args.max_steps):
