@@ -1,4 +1,4 @@
-"""Async RTC control client for the Piper arm (local Windows / robot side).
+r"""Async RTC control client for the Piper arm (local Windows / robot side).
 
 Full-version companion to `scripts/serve_policy_rtc.py`. It reuses the camera rig, robot
 interface and observation builder from `scripts/piper_remote_client.py` UNMODIFIED, and
@@ -57,6 +57,12 @@ class Args(prc.Args):
     synchronous: bool = False
 
 
+@dataclasses.dataclass
+class FetchResult:
+    chunk: np.ndarray
+    next_exec_idx: int
+
+
 class RTCFetcher:
     """Owns the websocket call + shared state between the main loop and the fetch thread."""
 
@@ -64,44 +70,65 @@ class RTCFetcher:
         self._client = client
         self._dt = control_dt
         self._lock = threading.Lock()
-        self._chunk: np.ndarray | None = None
+        self._result: FetchResult | None = None
+        self._error: BaseException | None = None
         self._busy = False
         self.delay_steps = int(default_delay)  # last measured inference latency, in control steps
         self.last_infer_ms = 0.0
 
-    def _do_fetch(self, obs: dict, *, reset: bool) -> None:
-        payload = dict(obs)
-        payload["rtc_reset"] = reset
-        payload["inference_delay"] = int(self.delay_steps)
-        t0 = time.monotonic()
-        result = self._client.infer(payload)
-        elapsed = time.monotonic() - t0
-        chunk = np.asarray(result["actions"], dtype=np.float32)
-        with self._lock:
-            self._chunk = chunk
-            self.delay_steps = max(1, math.ceil(elapsed / self._dt))
-            self.last_infer_ms = elapsed * 1000.0
-            self._busy = False
+    def _do_fetch(self, obs: dict, *, reset: bool, executed: int, next_exec_idx: int) -> None:
+        try:
+            payload = dict(obs)
+            payload["rtc_reset"] = reset
+            payload["rtc_executed"] = int(executed)
+            payload["inference_delay"] = int(self.delay_steps)
+            t0 = time.monotonic()
+            result = self._client.infer(payload)
+            elapsed = time.monotonic() - t0
+            chunk = np.asarray(result["actions"], dtype=np.float32)
+            with self._lock:
+                self._result = FetchResult(chunk=chunk, next_exec_idx=int(next_exec_idx))
+                self.delay_steps = max(1, math.ceil(elapsed / self._dt))
+                self.last_infer_ms = elapsed * 1000.0
+                self._busy = False
+        except BaseException as exc:
+            with self._lock:
+                self._error = exc
+                self._busy = False
 
-    def fetch_blocking(self, obs: dict, *, reset: bool) -> np.ndarray:
-        self._do_fetch(obs, reset=reset)
-        return self.take()
+    def fetch_blocking(self, obs: dict, *, reset: bool, executed: int, next_exec_idx: int = 0) -> FetchResult:
+        self._do_fetch(obs, reset=reset, executed=executed, next_exec_idx=next_exec_idx)
+        result = self.take()
+        if result is None:
+            raise RuntimeError("RTC fetch failed without returning a chunk")
+        return result
 
-    def start_fetch(self, obs: dict, *, reset: bool = False) -> None:
+    def start_fetch(self, obs: dict, *, reset: bool = False, executed: int, next_exec_idx: int) -> None:
         with self._lock:
-            if self._busy or self._chunk is not None:
+            if self._busy or self._result is not None:
                 return
             self._busy = True
-        threading.Thread(target=self._do_fetch, args=(obs,), kwargs={"reset": reset}, daemon=True).start()
+            self._error = None
+        threading.Thread(
+            target=self._do_fetch,
+            args=(obs,),
+            kwargs={"reset": reset, "executed": executed, "next_exec_idx": next_exec_idx},
+            daemon=True,
+        ).start()
 
     def status(self) -> tuple[bool, bool]:
         with self._lock:
-            return self._busy, self._chunk is not None
+            if self._error is not None:
+                raise RuntimeError("RTC background fetch failed") from self._error
+            return self._busy, self._result is not None
 
-    def take(self) -> np.ndarray | None:
+    def take(self) -> FetchResult | None:
         with self._lock:
-            chunk, self._chunk = self._chunk, None
-            return chunk
+            if self._error is not None:
+                error, self._error = self._error, None
+                raise RuntimeError("RTC fetch failed") from error
+            result, self._result = self._result, None
+            return result
 
 
 def main(args: Args) -> None:
@@ -123,42 +150,59 @@ def main(args: Args) -> None:
 
     try:
         # First chunk: blocking, reset the server's RTC state for a fresh episode.
-        chunk = fetcher.fetch_blocking(observe(), reset=True)
+        first = fetcher.fetch_blocking(observe(), reset=True, executed=0)
+        chunk = first.chunk
+        exec_idx = first.next_exec_idx
+        steps_since_swap = 0
         print(f"step=0 first chunk shape={chunk.shape} infer={fetcher.last_infer_ms:.0f}ms")
-        exec_idx = 0
 
         for step in range(args.max_steps):
             start = time.perf_counter()
 
             # Prefetch the next chunk once we are within `lead` steps of the boundary.
-            # `lead` adapts to the measured inference latency (delay_steps) so a slow/laggy
-            # fetch starts earlier and still arrives before the swap; floored by --prefetch-lead.
+            # The request tells the server how much of this full chunk has already been
+            # executed, and records where the returned chunk should start at the swap.
             if not args.synchronous:
                 busy, ready = fetcher.status()
-                lead = min(eh, max(args.prefetch_lead, fetcher.delay_steps + 1))
-                if not busy and not ready and exec_idx >= eh - lead:
-                    fetcher.start_fetch(observe(), reset=False)
+                max_safe_lead = max(0, len(chunk) - eh)
+                requested_lead = min(eh, max(args.prefetch_lead, fetcher.delay_steps + 1))
+                lead = min(requested_lead, max_safe_lead)
+                if lead > 0 and not busy and not ready and steps_since_swap >= eh - lead:
+                    skip_at_swap = eh - steps_since_swap
+                    fetcher.start_fetch(
+                        observe(), reset=False, executed=exec_idx, next_exec_idx=skip_at_swap
+                    )
 
-            # Execute one action from the current chunk (clamp index to chunk length).
-            model_action = chunk[min(exec_idx, len(chunk) - 1)]
+            # Execute one action from the current full server chunk.
+            action_idx = min(exec_idx, len(chunk) - 1)
+            model_action = chunk[action_idx]
             obs_state = robot.get_state()
             current_state, model_action_dbg, sent_action = robot.send_action(model_action)
             if args.print_state_debug and step % max(1, args.print_every) == 0:
                 prc.print_debug(step, obs_state, current_state, model_action_dbg, sent_action)
             exec_idx += 1
+            steps_since_swap += 1
 
             # At the execution horizon, swap to the next chunk.
-            if exec_idx >= eh:
+            if steps_since_swap >= eh:
                 if args.synchronous:
-                    chunk = fetcher.fetch_blocking(observe(), reset=False)
+                    nxt = fetcher.fetch_blocking(observe(), reset=False, executed=exec_idx)
                 else:
                     nxt = fetcher.take()
+                    if nxt is None:
+                        busy, _ = fetcher.status()
+                        if not busy:
+                            nxt = fetcher.fetch_blocking(observe(), reset=False, executed=exec_idx)
                     while nxt is None:  # prefetch not back yet -> unavoidable stall
                         time.sleep(dt)
                         nxt = fetcher.take()
-                    chunk = nxt
-                print(f"step={step} swap chunk delay_steps={fetcher.delay_steps} infer={fetcher.last_infer_ms:.0f}ms")
-                exec_idx = 0
+                chunk = nxt.chunk
+                exec_idx = min(max(0, nxt.next_exec_idx), len(chunk) - 1)
+                steps_since_swap = 0
+                print(
+                    f"step={step} swap chunk start_idx={exec_idx} "
+                    f"delay_steps={fetcher.delay_steps} infer={fetcher.last_infer_ms:.0f}ms"
+                )
 
             elapsed = time.perf_counter() - start
             if elapsed < dt:

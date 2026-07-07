@@ -13,6 +13,8 @@ guiding prefix for the next chunk.
 
 Protocol additions (all optional, read from the obs dict, popped before transforms):
     obs["rtc_reset"]        : bool  -- start of a new episode; drop the stored prev chunk.
+    obs["rtc_executed"]     : int   -- how many actions from the previous server chunk had
+                                       already been executed when this observation was captured.
     obs["inference_delay"]  : int   -- measured #control-steps elapsed during inference on
                                        the client; sets how many leading prefix steps are
                                        hard-committed (weight 1.0). Falls back to config.
@@ -57,7 +59,7 @@ except ImportError:
 
 @dataclasses.dataclass
 class Args:
-    config: str = "pi05_piper_pick_and_place"
+    config: str = "pi05_piper_pick_and_place_v2"
     dir: str = "checkpoints/pi05_piper_pick_and_place/piper_pick_pi05_lora_v2/29999"
     port: int = 8000
     default_prompt: str | None = None
@@ -121,6 +123,7 @@ class RTCPolicy(_base_policy.BasePolicy):
         obs = dict(obs)
         if bool(obs.pop("rtc_reset", False)):
             self._prev_chunk = None
+        executed = int(obs.pop("rtc_executed", self._cfg.execution_horizon))
         inf_delay = obs.pop("inference_delay", None)
 
         inputs = self._policy._input_transform(obs)
@@ -134,17 +137,29 @@ class RTCPolicy(_base_policy.BasePolicy):
         if not use_guidance:
             chunk = self._sample_plain(self._state, srng, observation)
         else:
-            leftover = self._prev_chunk[:, eh:, :]
             ah = self._model.action_horizon
+            executed = int(np.clip(executed, 0, ah))
+            leftover = self._prev_chunk[:, executed:, :]
+            if leftover.shape[1] == 0:
+                chunk = self._sample_plain(self._state, srng, observation)
+                self._prev_chunk = np.asarray(chunk)
+                outputs = {
+                    "state": np.asarray(inputs["state"][0]),
+                    "actions": np.asarray(chunk[0]),
+                }
+                return self._policy._output_transform(outputs)
             delay = self._cfg.inference_delay if inf_delay is None else int(inf_delay)
-            exec_h = min(eh, leftover.shape[1])
-            w = rtc_sampling.get_prefix_weights(delay, exec_h, ah, self._cfg.prefix_attention_schedule)
+            prefix_end = min(leftover.shape[1], ah)
+            w = rtc_sampling.get_prefix_weights(delay, prefix_end, ah, self._cfg.prefix_attention_schedule)
             # Pad leftover to full chunk shape (model space).
             prev = jnp.asarray(np.pad(np.asarray(leftover), ((0, 0), (0, ah - leftover.shape[1]), (0, 0))))
             chunk = self._sample_guided(self._state, srng, observation, prev, jnp.asarray(w)[None, :, None])
 
         self._prev_chunk = np.asarray(chunk)  # model space, for next call's prefix
-        outputs = {"state": inputs["state"], "actions": np.asarray(chunk[0])}
+        outputs = {
+            "state": np.asarray(inputs["state"][0]),
+            "actions": np.asarray(chunk[0]),
+        }
         outputs = self._policy._output_transform(outputs)
         return outputs
 

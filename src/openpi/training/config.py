@@ -895,7 +895,7 @@ _CONFIGS = [
         num_train_steps=10_000,
     ),
     TrainConfig(
-        name="pi05_piper_pick_and_place",
+        name="pi05_piper_pick_and_place_v2",
         model=pi0_config.Pi0Config(
             dtype="float32",
             pi05=True,
@@ -906,7 +906,7 @@ _CONFIGS = [
         ),
         data=LeRobotPiperDataConfig(
             # Point this to the LeRobot repo id or local dataset alias you use under HF_LEROBOT_HOME.
-            repo_id="phoebe777777/piper-pick-up-repaired",
+            repo_id="phoebe777777/piper-pick-up-v2",
             base_config=DataConfig(prompt_from_task=True),
             use_delta_joint_actions=False,
         ),
@@ -928,8 +928,9 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_piper_pick_and_place/piper_pick_pi05_lora_v2/29999/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
+        num_train_steps=70_000,
     ),
     #
     # Fine-tuning Aloha configs.
