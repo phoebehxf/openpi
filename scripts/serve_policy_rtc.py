@@ -125,6 +125,7 @@ class RTCPolicy(_base_policy.BasePolicy):
             self._prev_chunk = None
         executed = int(obs.pop("rtc_executed", self._cfg.execution_horizon))
         inf_delay = obs.pop("inference_delay", None)
+        requested_delay = self._cfg.inference_delay if inf_delay is None else int(inf_delay)
 
         inputs = self._policy._input_transform(obs)
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -133,6 +134,16 @@ class RTCPolicy(_base_policy.BasePolicy):
         self._rng, srng = jax.random.split(self._rng)
         eh = self._cfg.execution_horizon
         use_guidance = self._rtc_enabled and self._prev_chunk is not None
+        diagnostics = {
+            "rtc_enabled": bool(self._rtc_enabled),
+            "rtc_used_guidance": bool(use_guidance),
+            "rtc_executed": int(executed),
+            "rtc_inference_delay": int(requested_delay),
+            "rtc_execution_horizon": int(eh),
+            "rtc_leftover_len": 0,
+            "rtc_prefix_end": 0,
+            "rtc_prefix_weights": [],
+        }
 
         if not use_guidance:
             chunk = self._sample_plain(self._state, srng, observation)
@@ -140,6 +151,8 @@ class RTCPolicy(_base_policy.BasePolicy):
             ah = self._model.action_horizon
             executed = int(np.clip(executed, 0, ah))
             leftover = self._prev_chunk[:, executed:, :]
+            diagnostics["rtc_executed"] = int(executed)
+            diagnostics["rtc_leftover_len"] = int(leftover.shape[1])
             if leftover.shape[1] == 0:
                 chunk = self._sample_plain(self._state, srng, observation)
                 self._prev_chunk = np.asarray(chunk)
@@ -147,10 +160,14 @@ class RTCPolicy(_base_policy.BasePolicy):
                     "state": np.asarray(inputs["state"][0]),
                     "actions": np.asarray(chunk[0]),
                 }
-                return self._policy._output_transform(outputs)
-            delay = self._cfg.inference_delay if inf_delay is None else int(inf_delay)
+                outputs = self._policy._output_transform(outputs)
+                outputs.update(diagnostics)
+                return outputs
+            delay = requested_delay
             prefix_end = min(leftover.shape[1], ah)
             w = rtc_sampling.get_prefix_weights(delay, prefix_end, ah, self._cfg.prefix_attention_schedule)
+            diagnostics["rtc_prefix_end"] = int(prefix_end)
+            diagnostics["rtc_prefix_weights"] = np.round(w, 4).tolist()
             # Pad leftover to full chunk shape (model space).
             prev = jnp.asarray(np.pad(np.asarray(leftover), ((0, 0), (0, ah - leftover.shape[1]), (0, 0))))
             chunk = self._sample_guided(self._state, srng, observation, prev, jnp.asarray(w)[None, :, None])
@@ -161,6 +178,7 @@ class RTCPolicy(_base_policy.BasePolicy):
             "actions": np.asarray(chunk[0]),
         }
         outputs = self._policy._output_transform(outputs)
+        outputs.update(diagnostics)
         return outputs
 
 

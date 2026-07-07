@@ -61,6 +61,7 @@ class Args(prc.Args):
 class FetchResult:
     chunk: np.ndarray
     next_exec_idx: int
+    diagnostics: dict
 
 
 class RTCFetcher:
@@ -86,8 +87,9 @@ class RTCFetcher:
             result = self._client.infer(payload)
             elapsed = time.monotonic() - t0
             chunk = np.asarray(result["actions"], dtype=np.float32)
+            diagnostics = {k: v for k, v in result.items() if k.startswith("rtc_")}
             with self._lock:
-                self._result = FetchResult(chunk=chunk, next_exec_idx=int(next_exec_idx))
+                self._result = FetchResult(chunk=chunk, next_exec_idx=int(next_exec_idx), diagnostics=diagnostics)
                 self.delay_steps = max(1, math.ceil(elapsed / self._dt))
                 self.last_infer_ms = elapsed * 1000.0
                 self._busy = False
@@ -148,13 +150,29 @@ def main(args: Args) -> None:
         obs, _, _ = prc.build_observation(cameras, robot, args.prompt, args.image_size, show_preview=args.show_preview)
         return obs
 
+    def format_rtc_diag(result: FetchResult) -> str:
+        diag = result.diagnostics
+        if not diag:
+            return "rtc_diag=missing (server is probably scripts/serve_policy.py, not serve_policy_rtc.py)"
+        weights = diag.get("rtc_prefix_weights", [])
+        if isinstance(weights, list) and len(weights) > 8:
+            weights = weights[:8] + ["..."]
+        return (
+            f"rtc_used={diag.get('rtc_used_guidance')} "
+            f"executed={diag.get('rtc_executed')} "
+            f"leftover={diag.get('rtc_leftover_len')} "
+            f"prefix_end={diag.get('rtc_prefix_end')} "
+            f"delay={diag.get('rtc_inference_delay')} "
+            f"weights={weights}"
+        )
+
     try:
         # First chunk: blocking, reset the server's RTC state for a fresh episode.
         first = fetcher.fetch_blocking(observe(), reset=True, executed=0)
         chunk = first.chunk
         exec_idx = first.next_exec_idx
         steps_since_swap = 0
-        print(f"step=0 first chunk shape={chunk.shape} infer={fetcher.last_infer_ms:.0f}ms")
+        print(f"step=0 first chunk shape={chunk.shape} infer={fetcher.last_infer_ms:.0f}ms {format_rtc_diag(first)}")
 
         for step in range(args.max_steps):
             start = time.perf_counter()
@@ -201,7 +219,8 @@ def main(args: Args) -> None:
                 steps_since_swap = 0
                 print(
                     f"step={step} swap chunk start_idx={exec_idx} "
-                    f"delay_steps={fetcher.delay_steps} infer={fetcher.last_infer_ms:.0f}ms"
+                    f"delay_steps={fetcher.delay_steps} infer={fetcher.last_infer_ms:.0f}ms "
+                    f"{format_rtc_diag(nxt)}"
                 )
 
             elapsed = time.perf_counter() - start
