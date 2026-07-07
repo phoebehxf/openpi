@@ -55,13 +55,92 @@ class Args(prc.Args):
     default_inference_delay: int = 2
     # Disable async prefetch (synchronous: stall each boundary). For A/B debugging only.
     synchronous: bool = False
+    # Print the raw VLA-predicted action curve before client smoothing/clipping.
+    print_action_curve: bool = False
+    # Rolling window used for per-step VLA action jitter stats.
+    action_curve_window: int = 30
+    # Print rolling stats every N control steps when --print-action-curve is enabled.
+    action_curve_every: int = 10
+    # Optional CSV path for raw VLA action samples actually selected for execution.
+    action_curve_csv: str | None = None
 
 
 @dataclasses.dataclass
 class FetchResult:
     chunk: np.ndarray
     next_exec_idx: int
-    diagnostics: dict
+
+
+class ActionCurveLogger:
+    def __init__(self, args: Args):
+        self._enabled = bool(args.print_action_curve)
+        self._window = max(2, int(args.action_curve_window))
+        self._every = max(1, int(args.action_curve_every))
+        self._history: list[np.ndarray] = []
+        self._csv = None
+        if args.action_curve_csv is not None:
+            self._enabled = True
+            self._csv = open(args.action_curve_csv, "w", encoding="utf-8")
+            self._csv.write("step,source,chunk_index,a0,a1,a2,a3,a4,a5,a6\n")
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def close(self) -> None:
+        if self._csv is not None:
+            self._csv.close()
+            self._csv = None
+
+    def _write_csv(self, step: int, source: str, chunk_index: int, action: np.ndarray) -> None:
+        if self._csv is None:
+            return
+        vals = ",".join(f"{float(x):.8f}" for x in np.asarray(action, dtype=np.float32)[:7])
+        self._csv.write(f"{step},{source},{chunk_index},{vals}\n")
+        self._csv.flush()
+
+    def log_chunk(self, *, step: int, source: str, chunk: np.ndarray, start_idx: int, horizon: int) -> None:
+        if not self._enabled:
+            return
+        chunk = np.asarray(chunk, dtype=np.float32)
+        end = min(len(chunk), start_idx + horizon)
+        segment = chunk[start_idx:end, :7]
+        print(
+            f"[vla_curve] step={step} {source} start_idx={start_idx} "
+            f"rows={segment.shape[0]} dims=joint1..joint6,gripper"
+        )
+        print(np.array2string(segment, precision=4, suppress_small=False, max_line_width=160))
+        for i, action in enumerate(segment):
+            self._write_csv(step, source, start_idx + i, action)
+        if segment.shape[0] >= 2:
+            delta = np.diff(segment, axis=0)
+            print(
+                f"[vla_curve] step={step} {source} delta_mean_abs="
+                f"{np.round(np.mean(np.abs(delta), axis=0), 5).tolist()} "
+                f"delta_max_abs={np.round(np.max(np.abs(delta), axis=0), 5).tolist()} "
+                f"delta_l2_mean={float(np.linalg.norm(delta[:, :6], axis=1).mean()):.5f} "
+                f"delta_l2_max={float(np.linalg.norm(delta[:, :6], axis=1).max()):.5f}"
+            )
+
+    def log_step(self, *, step: int, chunk_index: int, action: np.ndarray) -> None:
+        action = np.asarray(action, dtype=np.float32)[:7]
+        self._write_csv(step, "executed", chunk_index, action)
+        if not self._enabled:
+            return
+        self._history.append(action.copy())
+        if len(self._history) > self._window:
+            self._history = self._history[-self._window :]
+        if step % self._every != 0 or len(self._history) < 2:
+            return
+        arr = np.stack(self._history, axis=0)
+        delta = np.diff(arr, axis=0)
+        print(
+            f"[vla_curve] step={step} rolling_window={arr.shape[0]} "
+            f"selected_delta_mean_abs={np.round(np.mean(np.abs(delta), axis=0), 5).tolist()} "
+            f"selected_delta_max_abs={np.round(np.max(np.abs(delta), axis=0), 5).tolist()} "
+            f"selected_delta_l2_mean={float(np.linalg.norm(delta[:, :6], axis=1).mean()):.5f} "
+            f"selected_delta_l2_max={float(np.linalg.norm(delta[:, :6], axis=1).max()):.5f}"
+        )
 
 
 class RTCFetcher:
@@ -145,6 +224,7 @@ def main(args: Args) -> None:
     dt = 1.0 / args.control_hz
     eh = int(args.execution_horizon)
     fetcher = RTCFetcher(client, dt, args.default_inference_delay)
+    action_curve = ActionCurveLogger(args)
 
     def observe() -> dict:
         obs, _, _ = prc.build_observation(cameras, robot, args.prompt, args.image_size, show_preview=args.show_preview)
@@ -172,7 +252,8 @@ def main(args: Args) -> None:
         chunk = first.chunk
         exec_idx = first.next_exec_idx
         steps_since_swap = 0
-        print(f"step=0 first chunk shape={chunk.shape} infer={fetcher.last_infer_ms:.0f}ms {format_rtc_diag(first)}")
+        print(f"step=0 first chunk shape={chunk.shape} infer={fetcher.last_infer_ms:.0f}ms")
+        action_curve.log_chunk(step=0, source="first_chunk", chunk=chunk, start_idx=exec_idx, horizon=eh)
 
         for step in range(args.max_steps):
             start = time.perf_counter()
@@ -194,6 +275,7 @@ def main(args: Args) -> None:
             # Execute one action from the current full server chunk.
             action_idx = min(exec_idx, len(chunk) - 1)
             model_action = chunk[action_idx]
+            action_curve.log_step(step=step, chunk_index=action_idx, action=model_action)
             obs_state = robot.get_state()
             current_state, model_action_dbg, sent_action = robot.send_action(model_action)
             if args.print_state_debug and step % max(1, args.print_every) == 0:
@@ -222,6 +304,7 @@ def main(args: Args) -> None:
                     f"delay_steps={fetcher.delay_steps} infer={fetcher.last_infer_ms:.0f}ms "
                     f"{format_rtc_diag(nxt)}"
                 )
+                action_curve.log_chunk(step=step, source="swap_chunk", chunk=chunk, start_idx=exec_idx, horizon=eh)
 
             elapsed = time.perf_counter() - start
             if elapsed < dt:
@@ -234,6 +317,7 @@ def main(args: Args) -> None:
                 cv2.destroyAllWindows()
             except Exception:
                 pass
+        action_curve.close()
         cameras.close()
         robot.close()
 
