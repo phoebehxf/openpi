@@ -59,26 +59,6 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                # bci-piper jpeg_v1 compatibility
-                wire_format = obs.pop("_openpi_image_wire_format", "raw_rgb")
-                if wire_format == "jpeg_v1":
-                    import io
-                    import numpy as np
-                    from PIL import Image
-                    for jpeg_key, image_key in (
-                        ("observation/image_jpeg", "observation/image"),
-                        ("observation/wrist_image_jpeg", "observation/wrist_image"),
-                    ):
-                        payload = obs.pop(jpeg_key, None)
-                        if not isinstance(payload, (bytes, bytearray, memoryview)):
-                            raise ValueError(f"jpeg_v1 request missing byte payload {jpeg_key!r}")
-                        with Image.open(io.BytesIO(bytes(payload))) as image:
-                            obs[image_key] = np.asarray(
-                                image.convert("RGB"), dtype=np.uint8
-                            ).copy()
-                elif wire_format != "raw_rgb":
-                    raise ValueError(f"unsupported image wire format: {wire_format!r}")
-
                 action = self._policy.infer(obs)
                 infer_time = time.monotonic() - infer_time
 

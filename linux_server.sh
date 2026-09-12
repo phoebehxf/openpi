@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/serve_policy.py   --port 8000   policy:checkpoint   --policy.config pi05_piper_pick_and_place_v2   --policy.dir checkpoints/pi05_piper_pick_and_place_v2/piper_pick_pi05_lora_v4/69999

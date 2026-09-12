@@ -116,21 +116,31 @@ def load_episode_records(root: Path) -> list[dict[str, Any]]:
     if not pq_paths:
         raise FileNotFoundError(f"No episode parquet files found in {episodes_dir}.")
 
-    # Some v3 datasets store a primary episode manifest in `file-000.parquet` and
-    # additional per-data-file index shards in `file-XXX.parquet`. The auxiliary
-    # shards duplicate episode indices and break the v2 conversion by producing
-    # overwritten or empty per-episode parquet files. Prefer the primary manifest
-    # when it is present, and fall back to reading every shard only for datasets
-    # that do not provide it.
-    primary_paths = [path for path in pq_paths if path.name == "file-000.parquet"]
-    if primary_paths:
-        pq_paths = primary_paths
-
-    records: list[dict[str, Any]] = []
+    records_by_episode: dict[int, dict[str, Any]] = {}
     for pq_path in pq_paths:
         table = pq.read_table(pq_path)
-        records.extend(table.to_pylist())
+        for record in table.to_pylist():
+            episode_index = int(record["episode_index"])
+            previous = records_by_episode.get(episode_index)
+            if previous is not None:
+                # Some exporters repeat episode metadata in multiple shards.
+                # Equal routing information is harmless; conflicting duplicates
+                # must not be silently converted.
+                routing_keys = (
+                    "length",
+                    "data/chunk_index",
+                    "data/file_index",
+                    "dataset_from_index",
+                    "dataset_to_index",
+                )
+                if any(previous.get(key) != record.get(key) for key in routing_keys):
+                    raise ValueError(
+                        f"Conflicting metadata for episode {episode_index} in {episodes_dir}"
+                    )
+                continue
+            records_by_episode[episode_index] = record
 
+    records = list(records_by_episode.values())
     records.sort(key=lambda rec: int(rec["episode_index"]))
     return records
 

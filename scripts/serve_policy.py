@@ -29,6 +29,9 @@ class Checkpoint:
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
 
+    # Optional exported LoRA adapter directory or adapter.npz file.
+    adapter: str | None = None
+
 
 @dataclasses.dataclass
 class Default:
@@ -72,7 +75,7 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     EnvMode.LIBERO: Checkpoint(
         config="pi05_libero",
         # dir="gs://openpi-assets/checkpoints/pi05_libero",
-        dir="gs://openpi-assets/checkpoints/pi05_base"
+        dir="gs://openpi-assets/checkpoints/pi05_base",
     ),
 }
 
@@ -91,7 +94,10 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                adapter_path=args.policy.adapter,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

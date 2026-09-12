@@ -207,7 +207,7 @@ def eval_step(
     return jnp.mean((pred - actions) ** 2, axis=(0, 1))  # (action_dim,)
 
 
-def main(config: _config.TrainConfig):
+def main(config: _config.TrainConfig, *, checkpoint_io=_checkpoints):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -225,7 +225,7 @@ def main(config: _config.TrainConfig):
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
-    checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
+    checkpoint_manager, resuming = checkpoint_io.initialize_checkpoint_dir(
         config.checkpoint_dir,
         keep_period=config.keep_period,
         overwrite=config.overwrite,
@@ -262,12 +262,15 @@ def main(config: _config.TrainConfig):
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 
-    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+    initialize_from_base = resuming and getattr(checkpoint_io, "initialize_from_base_on_resume", False)
+    train_state, train_state_sharding = init_train_state(
+        config, init_rng, mesh, resume=resuming and not initialize_from_base
+    )
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = checkpoint_io.restore_state(checkpoint_manager, train_state, data_loader)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -327,7 +330,7 @@ def main(config: _config.TrainConfig):
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            checkpoint_io.save_state(checkpoint_manager, train_state, data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
