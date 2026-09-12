@@ -324,35 +324,71 @@ class PiperRobotClient:
             with box_path.open("r", encoding="utf-8") as handle:
                 raw_box = json.load(handle)
             box = {
-                key: float(raw_box[key])
-                for key in ("x_min", "x_max", "y_min", "y_max", "z_min", "z_max")
+                "x_min": float(raw_box.get("x_min", -np.inf)),
+                "x_max": float(raw_box.get("x_max", np.inf)),
+                "y_min": float(raw_box.get("y_min", -np.inf)),
+                "y_max": float(raw_box.get("y_max", np.inf)),
+                "z_min": float(raw_box.get("z_min", -np.inf)),
+                "z_max": float(raw_box.get("z_max", np.inf)),
             }
             box["r_min"] = float(raw_box.get("r_min", 0.0))
             box["margin_m"] = float(raw_box.get("margin_m", 0.0))
+            plane_raw = raw_box.get("floor_plane")
+            if isinstance(plane_raw, dict):
+                box["floor_plane"] = (
+                    float(plane_raw["x_coefficient"]),
+                    float(plane_raw["y_coefficient"]),
+                    float(plane_raw["intercept_m"]),
+                )
+            elif plane_raw is not None:
+                box["floor_plane"] = tuple(float(value) for value in plane_raw)
+            else:
+                box["floor_plane"] = None
             if args.workspace_floor_margin_m is not None:
                 requested_margin = float(args.workspace_floor_margin_m)
                 if not np.isfinite(requested_margin) or requested_margin < 0.0:
                     raise ValueError("workspace_floor_margin_m must be finite and non-negative")
-                taught_touch_z = box["z_min"] - box["margin_m"]
-                box["z_min"] = taught_touch_z + requested_margin
+                # A fitted plane describes table contact directly, whereas legacy
+                # z_min already includes the margin stored alongside it.
+                if box["floor_plane"] is None:
+                    taught_touch_z = box["z_min"] - box["margin_m"]
+                    box["z_min"] = taught_touch_z + requested_margin
                 box["margin_m"] = requested_margin
-            if not all(np.isfinite(value) for value in box.values()):
-                raise ValueError(f"Workspace box contains non-finite values: {box_path}")
             for axis in ("x", "y", "z"):
-                if box[f"{axis}_min"] >= box[f"{axis}_max"]:
+                lower = box[f"{axis}_min"]
+                upper = box[f"{axis}_max"]
+                if np.isnan(lower) or np.isnan(upper) or lower >= upper:
                     raise ValueError(f"Invalid workspace {axis} bounds in {box_path}")
-            if box["r_min"] < 0.0:
+            if box["floor_plane"] is not None:
+                if len(box["floor_plane"]) != 3 or not all(
+                    np.isfinite(value) for value in box["floor_plane"]
+                ):
+                    raise ValueError(f"Invalid workspace floor_plane in {box_path}")
+            elif not np.isfinite(box["z_min"]):
+                raise ValueError(
+                    f"Workspace {box_path} must define either z_min or floor_plane"
+                )
+            if not np.isfinite(box["margin_m"]) or box["margin_m"] < 0.0:
+                raise ValueError(f"Invalid workspace margin_m in {box_path}")
+            if not np.isfinite(box["r_min"]) or box["r_min"] < 0.0:
                 raise ValueError(f"Invalid negative r_min in {box_path}")
             if self._robot.real and not hasattr(self._robot.robot, "fk"):
                 raise RuntimeError(
                     "Workspace safety requires the robot driver's fk(joints) method, but it is unavailable."
                 )
             self._workspace_box = box
+            floor_description = (
+                "floor_plane="
+                f"{box['floor_plane'][0]:+.6f}*x{box['floor_plane'][1]:+.6f}*y"
+                f"{box['floor_plane'][2]:+.6f}+margin({box['margin_m']:.3f})"
+                if box["floor_plane"] is not None
+                else f"z_min={box['z_min']:.3f}"
+            )
             print(
                 f"[safety] workspace box enabled: {box_path} "
                 f"x=[{box['x_min']:.3f},{box['x_max']:.3f}] "
                 f"y=[{box['y_min']:.3f},{box['y_max']:.3f}] "
-                f"z=[{box['z_min']:.3f},{box['z_max']:.3f}] "
+                f"{floor_description} z_max={box['z_max']:.3f} "
                 f"r_min={box['r_min']:.3f} m"
             )
 
@@ -408,6 +444,18 @@ class PiperRobotClient:
         # the live pose used when the workspace was taught.
         tcp_model_residual_xyz = measured_tcp[:3] - current_tcp_model[:3]
 
+        def workspace_floor_z(x: float, y: float) -> float:
+            if box is None:
+                return -np.inf
+            plane = box["floor_plane"]
+            if plane is None:
+                return float(box["z_min"])
+            a, b, c = plane
+            return a * float(x) + b * float(y) + c + box["margin_m"]
+
+        def workspace_touch_z(x: float, y: float) -> float:
+            return workspace_floor_z(x, y) - box["margin_m"]
+
         def violation_at(xyz: np.ndarray) -> tuple[float, Optional[str]]:
             """Return the largest Cartesian fence violation in meters."""
             x, y, z = (float(v) for v in xyz[:3])
@@ -423,8 +471,11 @@ class PiperRobotClient:
                     violations.append((box["y_min"] - y, f"y below {box['y_min']:.4f} m"))
                 elif y > box["y_max"]:
                     violations.append((y - box["y_max"], f"y above {box['y_max']:.4f} m"))
-                if z < box["z_min"]:
-                    violations.append((box["z_min"] - z, f"z below {box['z_min']:.4f} m"))
+                local_floor_z = workspace_floor_z(x, y)
+                if z < local_floor_z:
+                    violations.append(
+                        (local_floor_z - z, f"z below local floor {local_floor_z:.4f} m")
+                    )
                 elif z > box["z_max"]:
                     violations.append((z - box["z_max"], f"z above {box['z_max']:.4f} m"))
                 radius = float(np.hypot(x, y))
@@ -465,41 +516,42 @@ class PiperRobotClient:
         # local numerical-Jacobian correction: among joint-space changes that lift the
         # target back to the floor, it makes the smallest change to the original target,
         # so lateral motion is retained as much as possible.
-        floor_z = max(
-            value for value in (
-                min_z,
-                box["z_min"] if box is not None else None,
-            ) if value is not None
-        )
-        effective_floor_z = floor_z - allowed_violation_m
         projected_target = target.astype(np.float64, copy=True)
         projection_used = False
         jacobian_eps = 1e-4
+
+        def floor_clearance(xyz: np.ndarray) -> float:
+            floor_candidates = [workspace_floor_z(xyz[0], xyz[1])]
+            if min_z is not None:
+                floor_candidates.append(min_z)
+            return float(xyz[2]) - max(floor_candidates) + allowed_violation_m
+
         for _ in range(4):
             target_xyz = predict_tcp_xyz(projected_target)
-            deficit = effective_floor_z - float(target_xyz[2])
+            deficit = -floor_clearance(target_xyz)
             if deficit <= 1e-5:
                 break
-            dz_dq = np.empty(6, dtype=np.float64)
+            dclearance_dq = np.empty(6, dtype=np.float64)
             for joint_index in range(6):
                 plus = projected_target.copy()
                 minus = projected_target.copy()
                 plus[joint_index] += jacobian_eps
                 minus[joint_index] -= jacobian_eps
-                dz_dq[joint_index] = (
-                    predict_tcp_xyz(plus)[2] - predict_tcp_xyz(minus)[2]
+                dclearance_dq[joint_index] = (
+                    floor_clearance(predict_tcp_xyz(plus))
+                    - floor_clearance(predict_tcp_xyz(minus))
                 ) / (2.0 * jacobian_eps)
-            norm_sq = float(dz_dq @ dz_dq)
+            norm_sq = float(dclearance_dq @ dclearance_dq)
             if norm_sq < 1e-10:
                 break
-            projected_target += (deficit / norm_sq) * dz_dq
+            projected_target += (deficit / norm_sq) * dclearance_dq
             projected_target = np.clip(
                 projected_target,
                 current - self._max_joint_delta_rad,
                 current + self._max_joint_delta_rad,
             )
             projection_used = True
-        if projection_used and predict_tcp_xyz(projected_target)[2] >= effective_floor_z - 1e-5:
+        if projection_used and floor_clearance(predict_tcp_xyz(projected_target)) >= -1e-5:
             print(
                 "[safety] removed downward action component; "
                 f"target_z={predict_tcp_xyz(target)[2]:.4f} -> "
@@ -524,7 +576,7 @@ class PiperRobotClient:
         if violation is not None:
             clearance_text = ""
             if box is not None:
-                touch_z = box["z_min"] - box["margin_m"]
+                touch_z = workspace_touch_z(violation_xyz[0], violation_xyz[1])
                 clearance_text = (
                     f" estimated_clearance_above_taught_touch="
                     f"{float(violation_xyz[2]) - touch_z:.4f} m;"

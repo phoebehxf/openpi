@@ -50,6 +50,8 @@ class Args:
     port: int = 8000
     # Record the policy's behavior for debugging.
     record: bool = False
+    # Save each exact websocket request plus decoded inputs and policy outputs.
+    capture_dir: str | None = None
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -114,6 +116,7 @@ def main(args: Args) -> None:
         host="0.0.0.0",
         port=args.port,
         metadata=policy_metadata,
+        capture_dir=args.capture_dir,
     )
     server.serve_forever()
 
