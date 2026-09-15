@@ -38,9 +38,12 @@ def replace(table, key, values):
     return table.set_column(i, key, pa.array(values, type=table.schema.field(i).type))
 
 
-def merge(sources, output):
+def merge(sources, output, *, exclude_episodes=None):
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite {output}")
+    exclude_episodes = set(exclude_episodes or ())
+    if exclude_episodes and len(sources) != 1:
+        raise ValueError("Episode exclusion is only supported when filtering one source dataset")
     infos = [json.loads((s / "meta/info.json").read_text()) for s in sources]
     for info in infos:
         if info["codebase_version"] != "v2.1":
@@ -67,17 +70,23 @@ def merge(sources, output):
             if len(source_eps) != info["total_episodes"]:
                 raise ValueError("Episode count mismatch")
             source_frames = 0
+            examined_source_frames = 0
             for episode in source_eps:
-                old, new = episode["episode_index"], len(episodes)
+                old = episode["episode_index"]
                 fmt = {"episode_index": old, "episode_chunk": old // info["chunks_size"]}
                 table = pq.read_table(source / info["data_path"].format(**fmt))
                 n = len(table)
+                examined_source_frames += n
                 if n != episode["length"] or not np.all(np.asarray(table["episode_index"]) == old):
                     raise ValueError(f"Invalid episode {source}/{old}")
                 if not np.array_equal(np.asarray(table["frame_index"]), np.arange(n)):
                     raise ValueError("Non-contiguous frame_index")
                 if not np.allclose(np.asarray(table["timestamp"]), np.arange(n) / info["fps"], atol=1e-4):
                     raise ValueError("Unexpected timestamps")
+                if old in exclude_episodes:
+                    print(f"Excluded episode: {source.name}/{old}, {n} frames", flush=True)
+                    continue
+                new = len(episodes)
                 table = replace(table, "episode_index", [new] * n)
                 table = replace(table, "index", range(frame_offset, frame_offset + n))
                 table = replace(table, "task_index", [mapping[t] for t in table["task_index"].to_pylist()])
@@ -107,7 +116,7 @@ def merge(sources, output):
                 frame_offset += n
                 source_frames += n
                 print(f"Merged episode {new}: {source.name}/{old}, {n} frames", flush=True)
-            if source_frames != info["total_frames"]:
+            if examined_source_frames != info["total_frames"]:
                 raise ValueError("Source total_frames mismatch")
         info = copy.deepcopy(infos[0])
         info.update(
@@ -146,7 +155,17 @@ if __name__ == "__main__":
         type=Path,
         help="Input dataset directory; repeat for every dataset. Overrides the built-in SOURCES list.",
     )
+    parser.add_argument(
+        "--exclude-episodes",
+        type=str,
+        help="Comma-separated source episode indices to omit; requires exactly one --source.",
+    )
     parser.add_argument("--output", type=Path, default=ROOT / "local_datasets" / REPO_ID)
     args = parser.parse_args()
     sources = args.source if args.source else [args.source_home / name for name in SOURCES]
-    merge([source.expanduser().resolve() for source in sources], args.output.resolve())
+    excluded = [] if not args.exclude_episodes else [int(value) for value in args.exclude_episodes.split(",")]
+    merge(
+        [source.expanduser().resolve() for source in sources],
+        args.output.resolve(),
+        exclude_episodes=excluded,
+    )

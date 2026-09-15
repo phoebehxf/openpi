@@ -970,6 +970,32 @@ _CONFIGS = [
             pytorch_weight_path="/path/to/your/pytorch_weight_path",
             num_train_steps=70_000,
         ),
+    # Full-rank pi0.5 model used by scripts/train_piper_multitask_full.py.
+    # Keep this model/data interface in sync with that script so a checkpoint
+    # trained with FSDP on A100s can be served on one inference GPU.
+    TrainConfig(
+        name="pi05_piper_multitask_full",
+        model=pi0_config.Pi0Config(
+            dtype="float32",
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="local/piper-all-manipulation-cleaned-v1",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        batch_size=8,
+        freeze_filter=nnx.Nothing(),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=40_000,
+    ),
     #
     # Fine-tuning Aloha configs.
     #

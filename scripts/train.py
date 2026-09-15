@@ -2,6 +2,7 @@ import dataclasses
 import functools
 import logging
 import platform
+import re
 from typing import Any
 
 import etils.epath as epath
@@ -17,6 +18,7 @@ import tqdm_loggable.auto as tqdm
 import wandb
 
 import openpi.models.model as _model
+import openpi.models.tokenizer as _tokenizer
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
@@ -197,17 +199,48 @@ def eval_step(
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
-) -> at.Array:
-    """Sample an action chunk and return per-dim MSE (normalized space) vs ground truth."""
+) -> dict[str, at.Array]:
+    """Return per-sample flow loss, sampled actions, and normalized squared error."""
     params = state.ema_params if state.ema_params is not None else state.params
     model = nnx.merge(state.model_def, params)
     model.eval()
     observation, actions = batch
     pred = model.sample_actions(rng, observation, num_steps=config.eval_num_sample_steps)
-    return jnp.mean((pred - actions) ** 2, axis=(0, 1))  # (action_dim,)
+    flow_loss = jnp.mean(model.compute_loss(rng, observation, actions, train=False), axis=-1)
+    return {
+        "flow_loss": flow_loss,  # (batch,)
+        "pred_actions": pred,  # (batch, horizon, action_dim)
+        "squared_error": jnp.mean((pred - actions) ** 2, axis=1),  # (batch, action_dim)
+    }
 
 
-def main(config: _config.TrainConfig, *, checkpoint_io=_checkpoints):
+def _task_indices_from_tokenized_prompts(
+    observations: list[_model.Observation], task_names: list[str], max_token_len: int
+) -> list[np.ndarray]:
+    """Identify each eval sample by matching the task-only prefix before discrete state tokens."""
+    tokenizer = _tokenizer.PaligemmaTokenizer(max_token_len)
+    prefixes = []
+    for task in task_names:
+        cleaned = task.strip().replace("_", " ").replace("\n", " ")
+        prefixes.append(np.asarray(tokenizer._tokenizer.encode(f"Task: {cleaned}, State:", add_bos=True)))
+
+    result = []
+    for observation in observations:
+        rows = np.asarray(jax.device_get(observation.tokenized_prompt))
+        indices = np.full(rows.shape[0], -1, dtype=np.int32)
+        for sample_index, row in enumerate(rows):
+            matches = [i for i, prefix in enumerate(prefixes) if np.array_equal(row[: len(prefix)], prefix)]
+            if len(matches) == 1:
+                indices[sample_index] = matches[0]
+        result.append(indices)
+    return result
+
+
+def _metric_slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def main(config: _config.TrainConfig, *, checkpoint_io=_checkpoints, eval_config: _config.TrainConfig | None = None):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -245,15 +278,35 @@ def main(config: _config.TrainConfig, *, checkpoint_io=_checkpoints):
     # Hold out a small, fixed set of batches for the sampled-action RMSE eval. These are drawn once
     # and never trained on, so the metric tracks generalization of the action mapping.
     eval_batches: list[tuple[_model.Observation, _model.Actions]] = []
+    eval_task_indices: list[np.ndarray] = []
     eval_active_idx = None
     if config.eval_interval > 0 and config.eval_num_batches > 0:
-        eval_batches = [next(data_iter) for _ in range(config.eval_num_batches)]
+        if eval_config is None:
+            eval_batches = [next(data_iter) for _ in range(config.eval_num_batches)]
+        else:
+            # Some training-only input corruptions (for example state dropout)
+            # should not leak into the fixed sampled-action evaluation batches.
+            eval_loader = _data_loader.create_data_loader(
+                eval_config,
+                sharding=data_sharding,
+                shuffle=False,
+                num_batches=config.eval_num_batches,
+            )
+            eval_batches = list(iter(eval_loader))
         # Determine which action dims actually vary (the rest are zero-padding up to the model dim).
         all_act = np.concatenate(
             [np.asarray(jax.device_get(b[1])).reshape(-1, b[1].shape[-1]) for b in eval_batches], axis=0
         )
         eval_active_idx = np.where(all_act.std(axis=0) > 1e-6)[0]
         logging.info(f"Sampled-action eval: {len(eval_batches)} batches, active dims={eval_active_idx.tolist()}")
+        task_names = list((config.policy_metadata or {}).get("eval_task_names", ()))
+        if task_names:
+            eval_task_indices = _task_indices_from_tokenized_prompts(
+                [item[0] for item in eval_batches], task_names, config.model.max_token_len
+            )
+            unmatched = sum(int(np.sum(indices < 0)) for indices in eval_task_indices)
+            if unmatched:
+                logging.warning("Could not identify task for %d fixed eval samples", unmatched)
 
     # Log images from first batch to sanity check.
     images_to_log = [
@@ -307,13 +360,19 @@ def main(config: _config.TrainConfig, *, checkpoint_io=_checkpoints):
             infos = []
 
         if eval_batches and step % config.eval_interval == 0:
-            per_dim = []
+            eval_outputs = []
             with sharding.set_mesh(mesh):
                 for i, eb in enumerate(eval_batches):
                     # Fix the sampling seed per batch (independent of step) so the flow-matching noise
                     # is identical across checkpoints -- otherwise the RMSE curve is not comparable.
-                    per_dim.append(np.asarray(peval_step(jax.random.fold_in(eval_rng, i), train_state, eb)))
-            per_dim = np.sqrt(np.mean(per_dim, axis=0))  # per-dim RMSE (action_dim,)
+                    output = peval_step(jax.random.fold_in(eval_rng, i), train_state, eb)
+                    eval_outputs.append(jax.device_get(output))
+            squared_error = np.concatenate([np.asarray(item["squared_error"]) for item in eval_outputs])
+            flow_loss = np.concatenate([np.asarray(item["flow_loss"]) for item in eval_outputs])
+            pred_actions = np.concatenate([np.asarray(item["pred_actions"]) for item in eval_outputs])
+            true_actions = np.concatenate([np.asarray(item[1]) for item in eval_batches])
+            states = np.concatenate([np.asarray(item[0].state) for item in eval_batches])
+            per_dim = np.sqrt(np.mean(squared_error, axis=0))
             active = per_dim[eval_active_idx]
             metrics = {
                 "eval/sample_rmse_norm": float(active.mean()),
@@ -321,6 +380,35 @@ def main(config: _config.TrainConfig, *, checkpoint_io=_checkpoints):
                 # since it is the failure-prone dimension for pick-and-place.
                 "eval/gripper_rmse_norm": float(per_dim[eval_active_idx[-1]]),
             }
+
+            # A switch target is any future gripper action different from the
+            # current observed gripper state. Counting the full changed portion
+            # of a chunk gives a useful event metric even with a small fixed eval.
+            gripper_index = int(eval_active_idx[-1])
+            gt_gripper = true_actions[..., gripper_index]
+            pred_gripper = pred_actions[..., gripper_index]
+            gt_open = gt_gripper >= 0.0
+            switch_mask = gt_open != (states[:, None, gripper_index] >= 0.0)
+            predicted_correct = (pred_gripper >= 0.0) == gt_open
+            close_mask = switch_mask & ~gt_open
+            open_mask = switch_mask & gt_open
+            for name, mask in (("all", switch_mask), ("close", close_mask), ("open", open_mask)):
+                metrics[f"eval/gripper_switch_{name}_count"] = int(mask.sum())
+                if mask.any():
+                    metrics[f"eval/gripper_switch_{name}_accuracy"] = float(predicted_correct[mask].mean())
+
+            if eval_task_indices:
+                task_indices = np.concatenate(eval_task_indices)
+                task_names = list((config.policy_metadata or {})["eval_task_names"])
+                per_sample_active_mse = np.mean(squared_error[:, eval_active_idx], axis=1)
+                for task_index, task_name in enumerate(task_names):
+                    mask = task_indices == task_index
+                    if not mask.any():
+                        continue
+                    prefix = f"eval/task/{_metric_slug(task_name)}"
+                    metrics[f"{prefix}/loss"] = float(flow_loss[mask].mean())
+                    metrics[f"{prefix}/sample_rmse_norm"] = float(np.sqrt(per_sample_active_mse[mask].mean()))
+                    metrics[f"{prefix}/samples"] = int(mask.sum())
             pbar.write(
                 f"Step {step}: eval/sample_rmse_norm={metrics['eval/sample_rmse_norm']:.4f} "
                 f"gripper={metrics['eval/gripper_rmse_norm']:.4f}"
