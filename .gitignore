@@ -171,3 +171,4 @@ replay_data
 local_datasets
 *.mp4
 *.csv
+debug

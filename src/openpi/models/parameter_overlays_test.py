@@ -25,3 +25,12 @@ def test_overlay_rejects_incompatible_parameter_tree(tmp_path: pathlib.Path):
     parameter_overlays.save_overlay(flat, tmp_path, source_checkpoint="base/params")
     with pytest.raises(ValueError, match="Shape mismatch"):
         parameter_overlays.apply_overlay({"kernel": jnp.ones((3,))}, tmp_path)
+
+
+def test_save_overlay_flattens_nested_tree_without_extract(tmp_path: pathlib.Path):
+    changed = {"block": {"kernel": jnp.array([7.0, 8.0])}}
+    parameter_overlays.save_overlay(changed, tmp_path, source_checkpoint="base/params")
+
+    with np.load(tmp_path / parameter_overlays.OVERLAY_FILENAME) as archive:
+        assert archive.files == ["block/kernel"]
+        np.testing.assert_array_equal(archive["block/kernel"], np.array([7.0, 8.0]))

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import logging
+import os
 import pathlib
 
 from etils import epath
@@ -65,7 +67,9 @@ class CompactTrainableCheckpointIO:
         if state.ema_params is not None:
             raise ValueError("Compact trainable checkpoints require ema_decay=None.")
         trainable_state = state.params.filter(self._parameter_filter)
-        overlay_params = parameter_overlays.extract_overlay_params(trainable_state.to_pure_dict())
+        # Do not materialize a second full host copy of all trainable params.
+        # wait_until_finished below keeps the donated JAX buffers alive.
+        overlay_params = trainable_state.to_pure_dict()
         with at.disable_typechecking():
             compact_state = dataclasses.replace(state, params={})
 
@@ -81,12 +85,19 @@ class CompactTrainableCheckpointIO:
                 source_checkpoint=self._base_checkpoint,
             )
 
-        checkpoint_manager.save(
-            step,
-            {"assets": save_assets, "train_state": compact_state, "overlay": save_overlay},
-        )
-        # Surface failures here and never donate state while Orbax is reading it.
-        checkpoint_manager.wait_until_finished()
+        lock_path = pathlib.Path(os.environ.get("OPENPI_CHECKPOINT_SAVE_LOCK", "/tmp/openpi-checkpoint-save.lock"))
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("w") as lock_file:
+            logging.info("Waiting for global checkpoint save lock: %s", lock_path)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            logging.info("Acquired global checkpoint save lock for step %s", step)
+            checkpoint_manager.save(
+                step,
+                {"assets": save_assets, "train_state": compact_state, "overlay": save_overlay},
+            )
+            # Surface failures and keep donated buffers alive while Orbax reads them.
+            checkpoint_manager.wait_until_finished()
+            logging.info("Finished checkpoint step %s; releasing global save lock", step)
 
     def restore_state(self, checkpoint_manager, state, data_loader, step=None):
         del data_loader

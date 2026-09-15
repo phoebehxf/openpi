@@ -140,6 +140,13 @@ def merge(sources, output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-home", type=Path, default=Path.home() / ".cache/huggingface/lerobot/phoebe777777")
+    parser.add_argument(
+        "--source",
+        action="append",
+        type=Path,
+        help="Input dataset directory; repeat for every dataset. Overrides the built-in SOURCES list.",
+    )
     parser.add_argument("--output", type=Path, default=ROOT / "local_datasets" / REPO_ID)
     args = parser.parse_args()
-    merge([args.source_home / name for name in SOURCES], args.output.resolve())
+    sources = args.source if args.source else [args.source_home / name for name in SOURCES]
+    merge([source.expanduser().resolve() for source in sources], args.output.resolve())

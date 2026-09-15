@@ -21,6 +21,8 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 import train_pour_openpi_lora
 
 from openpi.policies import policy_config
+from openpi.shared import normalize
+from openpi_client import websocket_client_policy
 
 PHASES = (
     ("start", 0.00, 0.10),
@@ -57,11 +59,21 @@ def main() -> None:
         "piper_pour_water_cleaned_openpi_lora_v1/15500",
     )
     parser.add_argument("--samples-per-phase", type=int, default=1)
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=None,
+        help="Evaluate evenly spaced episodes instead of the full dataset.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path, default=Path("pour_phase_eval_15500.csv"))
+    parser.add_argument("--server-host", default=None, help="Use an already-running policy server.")
+    parser.add_argument("--server-port", type=int, default=8000)
     args = parser.parse_args()
     if args.samples_per_phase <= 0:
         parser.error("--samples-per-phase must be positive")
+    if args.episodes is not None and args.episodes <= 0:
+        parser.error("--episodes must be positive")
 
     cfg_args = types.SimpleNamespace(
         steps=30_000,
@@ -74,6 +86,7 @@ def main() -> None:
         exp_name="offline_eval",
         wandb=False,
         resume=False,
+        legacy=False,
     )
     train_config = train_pour_openpi_lora.build_config(cfg_args)
     horizon = train_config.model.action_horizon
@@ -83,21 +96,37 @@ def main() -> None:
         repo_id,
         delta_timestamps={"action": [step / meta.fps for step in range(horizon)]},
     )
-    base = train_pour_openpi_lora.BASE_PARAMS.parent
-    print(f"Loading base={base}")
-    print(f"Applying overlay={Path(args.adapter).resolve()}")
-    policy = policy_config.create_trained_policy(
-        train_config,
-        base,
-        adapter_path=args.adapter,
-    )
+    if args.server_host is not None:
+        print(f"Using policy server={args.server_host}:{args.server_port}")
+        policy = websocket_client_policy.WebsocketClientPolicy(args.server_host, args.server_port)
+        print(f"Server metadata={policy.get_server_metadata()}")
+    else:
+        base = train_pour_openpi_lora.BASE_PARAMS.parent
+        adapter = Path(args.adapter).resolve()
+        norm_stats = normalize.load(adapter / "assets" / repo_id)
+        print(f"Loading base={base}")
+        print(f"Applying overlay={adapter}")
+        policy = policy_config.create_trained_policy(
+            train_config,
+            base,
+            adapter_path=adapter,
+            norm_stats=norm_stats,
+        )
 
     episode_rows = [json.loads(line) for line in (ROOT / "local_datasets" / repo_id / "meta/episodes.jsonl").read_text().splitlines()]
+    selected_episode_indices = set(
+        range(len(episode_rows))
+        if args.episodes is None or args.episodes >= len(episode_rows)
+        else np.linspace(0, len(episode_rows) - 1, args.episodes, dtype=int).tolist()
+    )
     rng = np.random.default_rng(args.seed)
     rows: list[dict[str, float | int | str]] = []
     offset = 0
     for episode in episode_rows:
         length = int(episode["length"])
+        if int(episode["episode_index"]) not in selected_episode_indices:
+            offset += length
+            continue
         for phase, lo, hi in PHASES:
             frames = _sample_frames(length, lo, hi, args.samples_per_phase, horizon)
             rng.shuffle(frames)

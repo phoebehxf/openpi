@@ -61,6 +61,12 @@ class WebsocketPolicyServer:
 
     async def _handler(self, websocket: _server.ServerConnection):
         logger.info(f"Connection from {websocket.remote_address} opened")
+        # Stateful deployment wrappers (for example the gripper-state latch) must
+        # never leak state from a completed/aborted robot run into the next client.
+        reset_gripper_latch = getattr(self._policy, "reset_gripper_latch", None)
+        if callable(reset_gripper_latch):
+            reset_gripper_latch()
+            logger.info("Reset gripper latch for the new connection")
         packer = msgpack_numpy.Packer()
 
         await websocket.send(packer.pack(self._metadata))

@@ -739,7 +739,7 @@ def preprocess_image(image: np.ndarray, image_size: int) -> np.ndarray:
     return image_tools.convert_to_uint8(image)
 
 
-def draw_preview(global_raw: np.ndarray, wrist_raw: np.ndarray, global_model: np.ndarray, wrist_model: np.ndarray) -> None:
+def draw_preview(global_raw: np.ndarray, wrist_raw: np.ndarray, global_model: np.ndarray, wrist_model: np.ndarray) -> int:
     import cv2
 
     def _bgr(image: np.ndarray) -> np.ndarray:
@@ -774,7 +774,7 @@ def draw_preview(global_raw: np.ndarray, wrist_raw: np.ndarray, global_model: np
     model_panel = _pad_to_width(model_panel, preview_width)
     preview = np.vstack((raw_panel, model_panel))
     cv2.imshow("openpi piper preview", preview)
-    cv2.waitKey(1)
+    return cv2.waitKey(1) & 0xFF
 
 
 def build_observation(cameras: CameraRig, robot: PiperRobotClient, prompt: str, image_size: int, *, show_preview: bool):
@@ -783,8 +783,7 @@ def build_observation(cameras: CameraRig, robot: PiperRobotClient, prompt: str, 
     global_model = preprocess_image(global_raw, image_size)
     wrist_model = preprocess_image(wrist_raw, image_size)
 
-    if show_preview:
-        draw_preview(global_raw, wrist_raw, global_model, wrist_model)
+    preview_key = draw_preview(global_raw, wrist_raw, global_model, wrist_model) if show_preview else -1
 
     obs = {
         "observation/image": global_model,
@@ -792,6 +791,9 @@ def build_observation(cameras: CameraRig, robot: PiperRobotClient, prompt: str, 
         "observation/state": robot.get_state(),
         "prompt": prompt,
     }
+    if preview_key in (ord("r"), ord("R")):
+        obs["_reset_gripper_latch"] = True
+        print("[gripper] requested server latch reset (preview key 'r')")
     return obs, global_raw, wrist_raw
 
 

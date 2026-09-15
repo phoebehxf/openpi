@@ -34,18 +34,21 @@ def extract_overlay_params(params: at.Params) -> dict[str, np.ndarray]:
 
 
 def save_overlay(
-    flat_params: dict[str, np.ndarray],
+    params: at.Params,
     output_dir: pathlib.Path | str,
     *,
     source_checkpoint: str,
 ) -> pathlib.Path:
-    """Write an already snapshotted flat overlay without another array copy."""
+    """Write an overlay without materializing another full array copy."""
+    flat_params = flax.traverse_util.flatten_dict(params, sep="/")
     if not flat_params:
         raise ValueError("Parameter overlay is empty.")
     output_dir = pathlib.Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_path = output_dir / OVERLAY_FILENAME
-    # Uncompressed storage avoids a second large CPU/memory spike during save.
+    # Keep values as device arrays until NumPy serializes each entry. The
+    # caller waits for completion before the next donating train step, so an
+    # eager full-tree host copy is unnecessary and can trigger systemd-oomd.
     np.savez(archive_path, **flat_params)
     manifest: dict[str, Any] = {
         "format": "openpi_parameter_overlay",
