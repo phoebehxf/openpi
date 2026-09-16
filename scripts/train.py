@@ -289,7 +289,12 @@ def main(config: _config.TrainConfig, *, checkpoint_io=_checkpoints, eval_config
             eval_loader = _data_loader.create_data_loader(
                 eval_config,
                 sharding=data_sharding,
-                shuffle=False,
+                # The merged LeRobot dataset is grouped by source/task. Taking
+                # the first unshuffled batches therefore evaluates only the
+                # first task. TorchDataLoader uses config.seed, so shuffling
+                # here still produces one fixed, reproducible eval set for the
+                # entire run and across resumed stages.
+                shuffle=True,
                 num_batches=config.eval_num_batches,
             )
             eval_batches = list(iter(eval_loader))
@@ -310,7 +315,15 @@ def main(config: _config.TrainConfig, *, checkpoint_io=_checkpoints, eval_config
 
     # Log images from first batch to sanity check.
     images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+        wandb.Image(
+            (
+                (np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1) + 1.0)
+                / 2.0
+                * 255.0
+            )
+            .clip(0, 255)
+            .astype(np.uint8)
+        )
         for i in range(min(5, len(next(iter(batch[0].images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
@@ -409,6 +422,22 @@ def main(config: _config.TrainConfig, *, checkpoint_io=_checkpoints, eval_config
                     metrics[f"{prefix}/loss"] = float(flow_loss[mask].mean())
                     metrics[f"{prefix}/sample_rmse_norm"] = float(np.sqrt(per_sample_active_mse[mask].mean()))
                     metrics[f"{prefix}/samples"] = int(mask.sum())
+                    # Report switch behavior per task as well as globally. A
+                    # task metric is omitted when its fixed eval subset has no
+                    # corresponding switch target, rather than reporting a
+                    # misleading zero accuracy.
+                    task_action_mask = mask[:, None]
+                    for name, switch_type_mask in (
+                        ("all", switch_mask),
+                        ("close", close_mask),
+                        ("open", open_mask),
+                    ):
+                        task_switch_mask = switch_type_mask & task_action_mask
+                        metrics[f"{prefix}/gripper_switch_{name}_count"] = int(task_switch_mask.sum())
+                        if task_switch_mask.any():
+                            metrics[f"{prefix}/gripper_switch_{name}_accuracy"] = float(
+                                predicted_correct[task_switch_mask].mean()
+                            )
             pbar.write(
                 f"Step {step}: eval/sample_rmse_norm={metrics['eval/sample_rmse_norm']:.4f} "
                 f"gripper={metrics['eval/gripper_rmse_norm']:.4f}"

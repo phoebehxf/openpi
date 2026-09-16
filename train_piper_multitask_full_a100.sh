@@ -15,7 +15,10 @@ COMMON=(
   --save-interval 1000
   --keep-period 5000
   --eval-interval 1000
-  --eval-num-batches 4
+  # A deterministic shuffled eval subset. With batch 8 this evaluates 512
+  # samples, which is large enough to cover the grouped multitask dataset and
+  # substantially more rare open/close transitions than four batches.
+  --eval-num-batches 64
   --fsdp-devices 1
   --wandb
 )

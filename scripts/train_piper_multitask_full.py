@@ -155,7 +155,12 @@ def main() -> None:
     parser.add_argument("--save-interval", type=int, default=1_000)
     parser.add_argument("--keep-period", type=int, default=5_000)
     parser.add_argument("--eval-interval", type=int, default=1_000)
-    parser.add_argument("--eval-num-batches", type=int, default=4)
+    parser.add_argument(
+        "--eval-num-batches",
+        type=int,
+        default=64,
+        help="Number of deterministic shuffled batches in the fixed multitask evaluation subset.",
+    )
     parser.add_argument("--fsdp-devices", type=int, default=1)
     parser.add_argument("--max-norm-frames", type=int, default=50_000)
     parser.add_argument("--compute-norm", action="store_true")
