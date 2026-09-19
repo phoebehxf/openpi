@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GPU_ID="${TRAIN_GPU_ID:-0,1}"
+GPU_ID="${CUDA_VISIBLE_DEVICES:-0}"
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 REPO_ID="local/piper-cup-rack-pour-phase-merged-v1"
 NORM_STATS="assets/pi05_piper_pick_and_place_v2/${REPO_ID}/norm_stats.json"
